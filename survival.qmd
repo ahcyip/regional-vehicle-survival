@@ -1,0 +1,1965 @@
+---
+title: "survival and uvm analysis"
+author: "arthur yip"
+format: html
+editor: visual
+---
+
+# PLANNED CHANGE — per-year VIO stock instead of back-scaling (NOT YET ENACTED)
+
+Do not enact until Arthur says we are ready. When enacting, follow this plan.
+
+**Idea:** convert net imp/exp *rates* to vehicle *counts* using each year's actual VIO stock: `NetImpExp<y>_stock = rate(y) × stock(y)`. This replaces the current single-base approach, where the 2025 snapshot (`vehstockdata_forweightinggreene`, ages 2–8) is back-scaled with the assumed-1%/yr-growth factors `1 - 0.01*(2024 - y)` (`stock_factor()` in `netimports-summaries`; hard-coded 0.91–0.95 in `netimports-greene-compat`; `stock * 0.93` in the reconciliation chunk). We already load actual VIO for every year 2014–2025 (`exp_<year>_stock_interim.csv` → `data_list` in Phase 1), so no growth assumption is needed.
+
+**Steps:**
+
+1.  Phase 1: generalize `vehstockdata_forweightinggreene` into `vehstock_by_year` — for each year 2014–2025, stock by `STNAME` × `VehType` with `age = year - vehicle_model_year`, filtered to ages 2–8 (matching the rate windows). Build from `data_list`; write `data/state_vehtype_stock_by_year.csv` alongside the slim CSVs so Phase 1b stays self-contained (no full Experian reload).
+2.  `netimports-summaries`: join `net_imports_long` to `vehstock_by_year` by `(year, statename, VehicleClass)` and compute `value_stock = value * stock` per yearpair. Use **year1** of the yearpair (survival is n(t+1)/n(t) relative to the year-t fleet). Window summaries then operate on `value_stock` directly: `Average_stock = mean(value_stock)`, `Lo_stock`/`Hi_stock` from ±2 SD of `value_stock`. Delete `stock_factor()` and `stock_f`. Keep output column names (`Average_stock`, `Lo_stock`, `Hi_stock`) so the Sankey, leaflet, and comparison sections work unchanged.
+3.  `netimports-greene-compat`: replace `NetImpExp<yy>_stock = NetImpExp<yy> * stock * 0.9x` with the per-year join (`rate(y) × stock(y)`); `NetImpExpMean1519_stock` / `NetImpExpMean1421_stock` become means of the per-year stock values rather than mean-rate × 2025 stock × mean-factor. Bonus: 2014 and 2020+ yearpairs can now get proper `_stock` values (previously only 15–19 were hard-coded).
+4.  Reconciliation chunk ("Reconciliation of Greene net import/export by state"): replace `national_stock = sum(stock * 0.93)` with per-year national totals from `vehstock_by_year` (matched to the same years as the rate window being reconciled).
+5.  Validate: write an old-vs-new comparison CSV of all `_stock` columns. Expect the biggest deltas where actual fleet growth deviated from the 1%/yr assumption (COVID-era years) and in fast/slow-growing states.
+
+# TODO
+
+- try to generalize the pattern for each state
+  - e.g. by averaging over years. similar to plotting all years per state overlaid differentiating by color (done this).
+- done. chord diagram of state-to-state flows based on the merged data from Greene and me
+
+# Request/ guidance from Greene/UTK
+
+Define age as: (calendar year - model year). (MY are fixed. Lag age for comparison)
+
+Let n(t,a,c) be the number of vehicles in operation of vehicle class c, of age a, in calendar year t.
+
+The survival rate is n(t+1,a+1,c)/n(t,a,c) and the scrappage rate is 1-\[n(t+1,a+1,c)/n(t,a,c)\]
+
+We would like as many ages as are available in the Experian data (in the IHS data this was 50 for 2020).
+
+We need scrappage rates (or survival rates) by state and for the total U.S.
+
+We grouped vehicles into three classes: 1. passenger cars, 2. SUVs + vans, 3. pickup trucks.
+
+In our IHS data, we grouped the body types as follows: Passenger car = convertible, coupe, hatchback, sedan, wagon SUV + Van = SUV, Van Pickup = Pickup
+
+We attempted to include only vehicles up to class 2a, i.e. =\< 8,500 lbs. GVW. However, it may not be possible to make precise GVW distinctions given the data available. Approximation is OK. Exclude 2b. Exclude weird stuff like limos and fire trucks.
+
+Include I/O/fleetflag. split out later. Ben: 80% of fleet vehicles are rental cars... other = business, govt, leasing... If breaking out by fuel type etc. then also provide combined and separate.... need "weights".
+
+Data is from Eddie, processed via process_experian (Eagle), then process_experian_for_tempo.Rmd (stock section)
+
+note that this doesn't fill for all MY...
+
+<!-- ============================================================ -->
+
+<!-- PHASE 1: Data generation (expensive — run once, then skip)   -->
+
+<!-- ============================================================ -->
+
+# Phase 1: Load Experian data and compute survival rates
+
+```{r phase1-functions}
+library(tidyverse); library(patchwork)
+
+process_consecutive_years <- function(year1, year2) {
+  data1 <- data_list[[as.character(year1)]] %>% mutate(CY = year1, CY_index = 1)
+  data2 <- data_list[[as.character(year2)]] %>% mutate(CY = year2, CY_index = 2)
+
+  combined_data <- bind_rows(data1, data2) %>%
+    mutate(Age = CY - vehicle_model_year,
+           Age1 = year1 - vehicle_model_year,
+           Age2 = year2 - vehicle_model_year)
+  return(combined_data)
+}
+
+calculate_survival <- function(pair_of_years, region = "natl", fleet_sep = F, tech_sep = F) {
+  data <- processed_data_list[[as.character(pair_of_years)]]
+  if (fleet_sep & region == "natl" & !tech_sep) {
+    data <- data %>%
+      mutate(state_name = "USA", county_name = "USA", Tech = "ALL_TECHS")
+  } else if (fleet_sep & region == "state" & !tech_sep) {
+    data <- data %>%
+      mutate(county_name = "STATE", Tech = "ALL_TECHS")
+  } else if (fleet_sep & region == "county" & !tech_sep) {
+    data <- data %>%
+      mutate(Tech = "ALL_TECHS")
+  } else if (!fleet_sep & region == "natl" & !tech_sep) {
+    data <- data %>%
+      mutate(regtype = "ALL_OWNERS", state_name = "USA", county_name = "USA", Tech = "ALL_TECHS")
+  } else if (!fleet_sep & region == "state" & !tech_sep) {
+    data <- data %>%
+      mutate(regtype = "ALL_OWNERS", county_name = "STATE", Tech = "ALL_TECHS")
+  } else if (!fleet_sep & region == "county" & !tech_sep) {
+    data <- data %>%
+      mutate(regtype = "ALL_OWNERS", Tech = "ALL_TECHS")
+  } else if (fleet_sep & region == "natl" & tech_sep) {
+    data <- data %>%
+      mutate(state_name = "USA", county_name = "USA")
+  } else if (fleet_sep & region == "state"& tech_sep) {
+    data <- data %>%
+      mutate(county_name = "STATE")
+  } else if (fleet_sep & region == "county"& tech_sep) {
+    data <- data # all fields left alone!
+  } else if (!fleet_sep & region == "natl"& tech_sep) {
+    data <- data %>%
+      mutate(regtype = "ALL_OWNERS", state_name = "USA", county_name = "USA")
+  } else if (!fleet_sep & region == "state"& tech_sep) {
+    data <- data %>%
+      mutate(regtype = "ALL_OWNERS", county_name = "STATE")
+  } else if (!fleet_sep & region == "county"& tech_sep) {
+    data <- data %>%
+      mutate(regtype = "ALL_OWNERS")
+  }
+
+  data <- data %>%
+    filter(!is.na(VehicleClass)) %>%
+    group_by(regtype, Tech, state_name, county_name, Age1, VehicleClass, CY_index) %>%
+    summarize(stock = sum(stock, na.rm=T)) %>%
+    pivot_wider(names_from = "CY_index", values_from = "stock", names_prefix = "CY") %>%
+    mutate(survival = CY2/CY1)
+}
+```
+
+```{r phase1-load-and-compute}
+directory <- "c:/users/ayip/OneDrive - NREL (1)/from eagle/experian/"
+data_list <- list()
+
+for (year in 2014:2025) {
+  file_path <- paste0(directory, "exp_", year, "_stock_interim.csv")
+  data <- read_csv(file_path)
+  data_list[[as.character(year)]] <- data
+}
+
+data_list <- data_list %>% map(~ .x %>% mutate(
+  VehicleClass = case_when(
+    yip_tempo_class %in% c("Compact","Midsize") ~ "Car",
+    yip_tempo_class %in% c("SUV") ~ "SUV",
+    yip_tempo_class %in% c("Pickup") ~ "Pickup"),
+  state_name = if_else(state_name == "Dist. Of Columbia", "District of Columbia", state_name),
+  state_name = if_else(state_name == "District Of Columbia", "District of Columbia", state_name)) %>%
+  filter(state_name != "(293838699 rows)" & !is.na(state_name)))
+
+processed_data_list <- list()
+for (year in 2014:2024) {
+  year_next <- year + 1
+  processed_data_list[[paste0(year, year_next)]] <- process_consecutive_years(year, year_next)
+}
+
+year_pairs <- lapply(2014:2024, function(year) paste0(year, year + 1))
+
+national_survival_list <- year_pairs %>% setNames(year_pairs) %>% map(calculate_survival, region = "natl", fleet_sep = F, tech_sep = F)
+national_survival_list_fleetsep <- year_pairs %>% setNames(year_pairs) %>% map(calculate_survival, region = "natl", fleet_sep = T, tech_sep = F)
+state_survival_list <- year_pairs %>% setNames(year_pairs) %>% map(calculate_survival, region = "state", fleet_sep = F, tech_sep = F)
+state_survival_list_fleetsep <- year_pairs %>% setNames(year_pairs) %>% map(calculate_survival, region = "state", fleet_sep = T, tech_sep = F)
+```
+
+```{r phase1-save-csvs}
+surv_data_dir <- "c:/users/ayip/OneDrive - NREL (1)/survival and uvm/data"
+dir.create(surv_data_dir, showWarnings = FALSE, recursive = TRUE)
+
+# full pipeline CSVs (all columns, for Phase 2)
+national_survival_list |> bind_rows(.id = "year_pair") |> ungroup() |>
+  write_csv(file.path(surv_data_dir, "pipeline_national_survival_14to25.csv"))
+
+national_survival_list_fleetsep |> bind_rows(.id = "year_pair") |> ungroup() |>
+  write_csv(file.path(surv_data_dir, "pipeline_national_survival_fleetsep_14to25.csv"))
+
+state_survival_list |> bind_rows(.id = "year_pair") |> ungroup() |>
+  write_csv(file.path(surv_data_dir, "pipeline_state_survival_14to25.csv"))
+
+state_survival_list_fleetsep |> bind_rows(.id = "year_pair") |> ungroup() |>
+  write_csv(file.path(surv_data_dir, "pipeline_state_survival_fleetsep_14to25.csv"))
+
+# slim deliverables for Greene (same format as before)
+national_survival_list |> bind_rows(.id = "yearpair") |> ungroup() |>
+  select(yearpair, Age1, VehicleClass, survival) |>
+  write_csv(file.path(surv_data_dir, "national_14to25_survival.csv"))
+
+state_survival_list |> bind_rows(.id = "yearpair") |> ungroup() |>
+  select(yearpair, state_name, Age1, VehicleClass, survival) |>
+  write_csv(file.path(surv_data_dir, "state_14to25_survival.csv"))
+
+message("Phase 1 complete — CSVs saved to ", surv_data_dir)
+```
+
+<!-- ============================================================ -->
+
+<!-- PHASE 1b: Net imports from survival differences              -->
+
+<!-- (self-contained: needs only the slim CSVs from Phase 1 plus  -->
+
+<!--  exp_2025_stock_interim.csv — no full Experian reload)       -->
+
+<!-- ============================================================ -->
+
+# Phase 1b: Net imports of used vehicles, by state and vehicle type
+
+R replication of the NetImports tab chain of `StateNationalSurvivalRateDifferences19Mar2026NewMethod.xlsx` (raw tabs → trim → state-minus-national differences → per-state net-import rates), generalized to all yearpairs in the data and to three methods:
+
+- `simple` — unweighted mean of the survival difference over ages 1–7 (workbook cols D–K).
+- `old` — weighted mean over ages 2–8, weights = cumulative product of *national* survival within the same yearpair (the workbook's original method, cols AP–AV). Computed for **every** yearpair. **This is the production method** (see note below).
+- `new` — hybrid (workbook's "NewMethod", generalized): where a yearpair has the 6 consecutive prior yearpairs needed (2020/21 onward), the weight for age *a* follows the cohort backward through the *state's own* survival: s(yp, a) × s(yp−1, a−1) × … × s(yp−(a−2), 2). Earlier yearpairs fall back to the old method. (The workbook applied cohort weights only to its latest yearpair, 2021/22.) **Kept only as a validation check, not used downstream** (see note below).
+
+**Decision: national weights, not state weights (2026-07 email from Greene).** Greene tested national vs. state survival as weights on the 2021/22 yearpair and found them statistically equivalent (R² 0.99, slopes 0.98–1.00, intercepts ~0.00002–0.0003), so he chose to keep the simpler national-weights method. Our own `new` method *is* the state-weights test he ran (cohort weights follow the state's own survival) — reproducing his check on our pipeline for 2021/22 gives R² 0.997–0.999, slopes 0.977–0.999, intercepts −0.0003 to 0.00005 (see the validation chunk below), confirming his result independently. **`old` (national weights, all yearpairs) is therefore the production method** used in the Sankeys and headline results; `new` stays in the code as a documented robustness check but no longer gets its own Sankeys/comparisons.
+
+Deliberate differences from the workbook (all verified against the Mar 2026 file in `known_differences_vs_excel_mar2026.csv`):
+
+- Missing (−99) or implausible (\|survival\| ≥ 2) cells become `NA` instead of the 999 flag. A flagged cell in the target yearpair makes that state × yearpair value `NA` (it then drops out of year-window averages via `na.rm`); a flagged cell that only contaminates a cohort *weight* drops that age term and renormalizes. Currently this only affects DC Pickup 2016/17.
+- Alabama Pickup 2015/16 age-1: the Mar 2026 fix of the old hard-coded cell subtracts the age-2 national survival (`$S$50`) instead of age-1 (`S49`); R computes the intended value.
+- Tennessee's outlier 2014/15 value is excluded from weighted-method averages whenever the window includes 2014 (replicates the workbook's `AVERAGE(AQ:AW)`).
+
+```{r netimports-compute}
+library(tidyverse)
+
+surv_data_dir <- "c:/users/ayip/OneDrive - NREL (1)/survival and uvm/data"
+
+n_ages       <- 7            # ages 1-7 (simple) / 2-8 (weighted)
+cohort_depth <- n_ages - 1   # prior yearpairs needed for cohort weights
+
+# missing (-99) or implausible (|s| >= 2) -> NA (workbook flags these 999)
+trim_bad <- function(x) if_else(is.na(x) | abs(x) >= 2, NA_real_, x)
+sd_pop   <- function(x) {                     # STDEV.P, NA-tolerant
+  x <- x[!is.na(x)]
+  sqrt(mean((x - mean(x))^2))
+}
+# weighted mean for net-import rates:
+#  - any NA survival difference in the target yearpair -> the whole yearpair
+#    is NA ("drop DC Pickup 2016/17", averaged over the remaining years)
+#  - an NA *weight* only (cohort history passing through a flagged cell)
+#    -> drop that age term and renormalize, so later yearpairs survive
+wmean_ni <- function(x, w) {
+  if (anyNA(x)) return(NA_real_)
+  ok <- !is.na(w)
+  if (!any(ok)) return(NA_real_)
+  sum(x[ok] * w[ok]) / sum(w[ok])
+}
+
+state_surv_ni <- read_csv(file.path(surv_data_dir, "state_14to25_survival.csv"),
+                          show_col_types = FALSE) |>
+  select(1:5) |>
+  rename(yearpair = 1, statename = 2, Age = 3, VehicleClass = 4, Survival = 5)
+
+national_surv_ni <- read_csv(file.path(surv_data_dir, "national_14to25_survival.csv"),
+                             show_col_types = FALSE) |>
+  select(1:4) |>
+  rename(yearpair = 1, Age = 2, VehicleClass = 3, Survival = 4) |>
+  mutate(Age = suppressWarnings(as.numeric(Age)))
+
+yearpairs_ni <- sort(intersect(unique(state_surv_ni$yearpair),
+                               unique(national_surv_ni$yearpair)))
+stopifnot(all(diff(as.integer(str_sub(as.character(yearpairs_ni), 1, 4))) == 1))
+
+cohort_yps <- yearpairs_ni[seq_along(yearpairs_ni) > cohort_depth]
+
+state_t <- state_surv_ni |>
+  filter(Age >= 1) |>
+  mutate(surv_state = trim_bad(as.numeric(Survival)))
+
+nat_t <- national_surv_ni |>
+  filter(!is.na(Age), Age >= 1) |>
+  mutate(surv_nat = trim_bad(as.numeric(Survival)))
+
+# SND: state minus national, matched on yearpair x vehicle type x age
+snd <- state_t |>
+  select(yearpair, statename, VehicleClass, Age, surv_state) |>
+  left_join(nat_t |> select(yearpair, VehicleClass, Age, surv_nat),
+            by = join_by(yearpair, VehicleClass, Age)) |>
+  mutate(surv_diff = surv_state - surv_nat)
+
+# --- simple: mean diff over ages 1-7; any bad age -> NA for the yearpair ---
+simple_ni <- snd |>
+  filter(Age <= n_ages) |>
+  summarise(value       = sum(surv_diff) / n_ages,
+            n_ages_used = sum(!is.na(surv_diff)),
+            n_rows      = n(),
+            .by = c(VehicleClass, statename, yearpair))
+stopifnot(all(simple_ni$n_rows == n_ages))
+simple_ni <- simple_ni |> select(-n_rows)
+
+# --- old: national cumprod weights, ages 2-8, ALL yearpairs ---
+w_national <- nat_t |>
+  filter(Age >= 2, Age <= n_ages + 1) |>
+  arrange(VehicleClass, yearpair, Age) |>
+  group_by(VehicleClass, yearpair) |>
+  mutate(w = cumprod(surv_nat)) |>
+  ungroup() |>
+  select(yearpair, VehicleClass, Age, w)
+
+weighted_old <- snd |>
+  filter(Age >= 2, Age <= n_ages + 1) |>
+  inner_join(w_national, by = join_by(yearpair, VehicleClass, Age)) |>
+  summarise(value       = wmean_ni(surv_diff, w),
+            n_ages_used = sum(!is.na(surv_diff) & !is.na(w)),
+            .by = c(VehicleClass, statename, yearpair))
+
+# --- cohort weights: state's own survival followed backward ---
+cohort_steps <- crossing(end_yp  = cohort_yps,
+                         age_end = 2:(n_ages + 1),
+                         back    = 0:cohort_depth) |>
+  filter(back <= age_end - 2) |>
+  mutate(yearpair = yearpairs_ni[match(end_yp, yearpairs_ni) - back],
+         Age      = age_end - back)
+
+w_cohort <- cohort_steps |>
+  inner_join(state_t |>
+               select(yearpair, statename, VehicleClass, Age, surv_state),
+             by = join_by(yearpair, Age),
+             relationship = "many-to-many") |>
+  summarise(w = prod(surv_state), n = n(),
+            .by = c(VehicleClass, statename, end_yp, age_end))
+stopifnot(all(w_cohort$n == w_cohort$age_end - 1))   # full cohort history
+
+weighted_cohort <- snd |>
+  filter(yearpair %in% cohort_yps, Age >= 2, Age <= n_ages + 1) |>
+  inner_join(w_cohort |> select(-n),
+             by = join_by(VehicleClass, statename,
+                          yearpair == end_yp, Age == age_end)) |>
+  summarise(value       = wmean_ni(surv_diff, w),
+            n_ages_used = sum(!is.na(surv_diff) & !is.na(w)),
+            .by = c(VehicleClass, statename, yearpair))
+
+# --- new = hybrid: cohort where feasible, old-method fallback before ---
+weighted_new <- bind_rows(
+  weighted_old |> filter(!yearpair %in% cohort_yps),
+  weighted_cohort
+)
+
+net_imports_long <- bind_rows(
+  simple = simple_ni, old = weighted_old, new = weighted_new,
+  .id = "method"
+) |>
+  mutate(year = as.integer(str_sub(as.character(yearpair), 1, 4))) |>
+  arrange(method, VehicleClass, statename, yearpair)
+
+net_imports_long |> write_csv(file.path(surv_data_dir, "net_imports_long.csv"))
+```
+
+```{r netimports-summaries}
+# Averaging windows (start-year labels: 2014 = yearpair 2014/15)
+year_sets <- list(
+  yrs1519  = 2015:2019,                      # current qmd / Sankey default
+  yrs1421  = 2014:2021,                      # workbook window
+  yrs_excl = setdiff(2014:2024, c(2020, 2022)),  # headline: excl. COVID-era
+  yrs_all  = 2014:2024
+)
+
+year_set_labels <- c(
+  yrs1519  = "2015/16–2019/20",
+  yrs1421  = "2014/15–2021/22",
+  yrs_excl = "2014/15–2024/25 excl. 20/21 & 22/23",
+  yrs_all  = "2014/15–2024/25 (all)"
+)
+
+method_labels <- c(
+  simple = "simple (unweighted, ages 1-7)",
+  old    = "old method (national-survival weights)",
+  new    = "new method (cohort weights, hybrid pre-2020/21)"
+)
+
+# generalizes the 0.91-0.95 stock back-scaling factors (0.95 for 2019,
+# 0.91 for 2015, i.e. 1 - 0.01*(2024 - y)); stock base is the 2025 fleet
+stock_factor <- function(years) mean(1 - 0.01 * (2024 - years))
+
+vehstockdata_forweightinggreene <-
+  read_csv("C:/Users/ayip/OneDrive - NREL (1)/from eagle/experian/exp_2025_stock_interim.csv",
+           show_col_types = FALSE) |>
+  mutate(VehType = case_when(yip_tempo_class == "SUV" ~ "SUV",
+                             yip_tempo_class == "Pickup" ~ "Pickup",
+                             yip_tempo_class %in% c("Compact", "Midsize") ~ "Car",
+                             TRUE ~ NA_character_),
+         age = 2025 - vehicle_model_year,
+         STNAME = state_name) |>
+  filter(age <= 8, age >= 2) |>
+  summarise(stock = sum(stock), .by = c(STNAME, VehType))
+
+summarize_net_imports <- function(long_df, years, set_name) {
+  long_df |>
+    filter(year %in% years,
+           # workbook excludes Tennessee's outlier first yearpair from the
+           # weighted Average/Std.Dev (AVERAGE(AQ:AW)); simple Mean keeps it
+           !(method != "simple" & statename == "Tennessee" & year == 2014)) |>
+    summarise(Average = mean(value, na.rm = TRUE),
+              Std_Dev = sd_pop(value),
+              n_years = sum(!is.na(value)),
+              .by = c(method, VehicleClass, statename)) |>
+    mutate(Lo = Average - 2 * Std_Dev,
+           Hi = Average + 2 * Std_Dev,
+           # Mar-2026 workbook's new col BC: state's average is >2 SD from 0
+           significant = as.integer(abs(Average / Std_Dev) > 2),
+           year_set = set_name,
+           stock_f  = stock_factor(years))
+}
+
+net_imports_summary <- imap(year_sets,
+                            \(yrs, nm) summarize_net_imports(net_imports_long, yrs, nm)) |>
+  list_rbind() |>
+  left_join(vehstockdata_forweightinggreene,
+            by = join_by(VehicleClass == VehType, statename == STNAME)) |>
+  mutate(Average_stock = round(Average * stock * stock_f, -2),
+         Lo_stock      = round(Lo      * stock * stock_f, -2),
+         Hi_stock      = round(Hi      * stock * stock_f, -2))
+
+net_imports_summary |> write_csv(file.path(surv_data_dir, "net_imports_summary.csv"))
+```
+
+```{r netimports-greene-compat}
+# Backward-compatible greene_intermediate (simple method), same columns as
+# the old xlsx-based block so the reconciliation / leaflet-map sections
+# keep working. NetImpExpMean1421 averages available years (na.rm);
+# NetImpExpMean1519 keeps the plain 5-year formula, so DC Pickup (NA 2016)
+# propagates NA there and drops out of the 1519 map/Sankey.
+simple_clean <- simple_ni |>
+  mutate(year = as.integer(str_sub(as.character(yearpair), 1, 4)))
+
+greene_intermediate <- simple_clean |>
+  filter(year %in% 2014:2021) |>
+  group_by(VehType = VehicleClass, STNAME = statename) |>
+  summarise(NetImpExpMean1421 = mean(value, na.rm = TRUE), .groups = "drop") |>
+  left_join(
+    simple_clean |>
+      filter(year %in% 2015:2019) |>
+      mutate(yr2 = paste0("NetImpExp", str_sub(as.character(year), 3, 4))) |>
+      select(VehType = VehicleClass, STNAME = statename, yr2, value) |>
+      pivot_wider(names_from = yr2, values_from = value),
+    by = join_by(VehType, STNAME)
+  ) |>
+  left_join(vehstockdata_forweightinggreene, by = join_by(VehType, STNAME)) |>
+  mutate(NetImpExpMean1519 = (NetImpExp19 + NetImpExp18 + NetImpExp17 +
+                              NetImpExp16 + NetImpExp15) / 5,
+         NetImpExpMean1519_stock = (NetImpExpMean1519 * stock * 0.92) |> round(-2),
+         NetImpExpMean1421_stock = (NetImpExpMean1421 * stock * 0.93) |> round(-2),
+         NetImpExp19_stock = NetImpExp19 * stock * 0.95,
+         NetImpExp18_stock = NetImpExp18 * stock * 0.94,
+         NetImpExp17_stock = NetImpExp17 * stock * 0.93,
+         NetImpExp16_stock = NetImpExp16 * stock * 0.92,
+         NetImpExp15_stock = NetImpExp15 * stock * 0.91)
+
+greene_intermediate |> write_csv(file.path(surv_data_dir, "greene_intermediate.csv"))
+
+message("Phase 1b complete — net_imports CSVs saved to ", surv_data_dir)
+```
+
+## Validation against the Mar 2026 workbook
+
+Compares R values against the workbook's cached values for its 8 yearpairs (2014–2021). Every difference is written out with the reason where known; anything with `reason == "UNEXPLAINED"` deserves investigation.
+
+```{r netimports-validate}
+xlsx_path <- "c:/users/ayip/OneDrive - NREL (1)/survival and uvm/StateNationalSurvivalRateDifferences19Mar2026NewMethod.xlsx"
+
+ni_sheet <- readxl::read_excel(xlsx_path, sheet = "NetImports",
+                               col_names = FALSE, .name_repair = "minimal")
+
+# workbook layout: cols D-K (4:11) simple 2014-2021; AP-AW (42:49) weighted
+# (national weights 2014-2020, cohort 2021); state rows carry a name in col B
+excel_long <- ni_sheet[, c(1, 2, 4:11, 42:49)] |>
+  set_names(c("VehType", "State",
+              paste0("simple_", 2014:2021), paste0("weighted_", 2014:2021))) |>
+  filter(State %in% state_surv_ni$statename,
+         VehType %in% c("Car", "Pickup", "SUV")) |>
+  pivot_longer(-c(VehType, State), names_to = c("block", "year"),
+               names_sep = "_", names_transform = list(year = as.integer),
+               values_to = "excel", values_transform = list(excel = as.numeric))
+
+r_long <- net_imports_long |>
+  mutate(block = case_when(
+    method == "simple" ~ "simple",
+    method == "old" & year <= 2020 ~ "weighted",   # workbook used old method
+    method == "new" & year == 2021 ~ "weighted",   # ... except its last year
+    TRUE ~ NA_character_)) |>
+  filter(!is.na(block)) |>
+  select(VehType = VehicleClass, State = statename, block, year, r_value = value)
+
+validation <- excel_long |>
+  inner_join(r_long, by = join_by(VehType, State, block, year)) |>
+  filter(is.na(excel) | is.na(r_value) | abs(excel - r_value) > 1e-9) |>
+  mutate(reason = case_when(
+    State == "District of Columbia" & VehType == "Pickup" & year %in% 2016:2017 ~
+      "DC Pickup missing data: Excel truncated block / R drops flagged cells",
+    State == "Alabama" & VehType == "Pickup" & block == "simple" & year == 2015 ~
+      "Mar-2026 fix off by one row: O2399 subtracts age-2 national (S50) not age-1 (S49)",
+    State == "District of Columbia" & VehType == "Pickup" ~
+      "DC Pickup flagged cells -> NA/renormalized in R, 999 flows through in Excel",
+    TRUE ~ "UNEXPLAINED"))
+
+validation |> count(reason)
+validation |>
+  write_csv(file.path(surv_data_dir, "known_differences_vs_excel_mar2026.csv"))
+
+if (any(validation$reason == "UNEXPLAINED")) {
+  warning("Unexplained differences vs Mar 2026 workbook - inspect ",
+          "known_differences_vs_excel_mar2026.csv")
+}
+```
+
+<!-- ============================================================ -->
+
+<!-- PHASE 2: Read CSVs and derive all needed objects (fast)      -->
+
+<!-- ============================================================ -->
+
+# Phase 2: Read saved data and derive cumulative / aggregate objects
+
+```{r phase2-read-and-derive}
+library(tidyverse); library(patchwork)
+
+surv_data_dir <- "c:/users/ayip/OneDrive - NREL (1)/survival and uvm/data"
+
+calculate_cumulative_survival <- function(survival) {
+  survival %>%
+    filter(Age1 >= 1) %>%
+    group_by(regtype, Tech, state_name, county_name, VehicleClass) %>%
+    arrange(regtype, Tech, state_name, county_name, VehicleClass, Age1) %>%
+    mutate(cumulative_survival = cumprod(survival))
+}
+
+compute_national_aggregate <- function(df) {
+  df |>
+    filter(year_pair != "20202021", year_pair != "20222023") |>
+    group_by(regtype, Age1, VehicleClass) |>
+    summarize(CY2 = sum(CY2, na.rm = TRUE), CY1 = sum(CY1, na.rm = TRUE), .groups = "drop") |>
+    mutate(survival = CY2 / CY1) |>
+    filter(Age1 >= 1) |>
+    group_by(regtype, VehicleClass) |>
+    arrange(regtype, VehicleClass, Age1) |>
+    mutate(cumulative_survival = cumprod(survival))
+}
+
+# read CSVs
+national_surv <- read_csv(file.path(surv_data_dir, "pipeline_national_survival_14to25.csv"))
+national_surv_fleetsep <- read_csv(file.path(surv_data_dir, "pipeline_national_survival_fleetsep_14to25.csv"))
+state_surv <- read_csv(file.path(surv_data_dir, "pipeline_state_survival_14to25.csv"))
+state_surv_fleetsep <- read_csv(file.path(surv_data_dir, "pipeline_state_survival_fleetsep_14to25.csv"))
+greene_intermediate <- read_csv(file.path(surv_data_dir, "greene_intermediate.csv"))
+net_imports_long <- read_csv(file.path(surv_data_dir, "net_imports_long.csv"))
+net_imports_summary <- read_csv(file.path(surv_data_dir, "net_imports_summary.csv"))
+
+# year pair metadata
+year_pair_levels <- national_surv |> distinct(year_pair) |> pull(year_pair) |> sort()
+
+# national aggregates (excluding 20-21 and 22-23)
+national_aggregate_allyears <- compute_national_aggregate(national_surv)
+national_aggregate_allyears_fleetsep <- compute_national_aggregate(national_surv_fleetsep)
+
+# cumulative versions (split by year_pair for compatibility with downstream code)
+cumulative_state_survival_list <- state_surv |> group_split(year_pair) |>
+  setNames(map_chr(group_split(state_surv, year_pair), ~ unique(.x$year_pair))) |>
+  map(calculate_cumulative_survival)
+
+cumulative_state_survival_list_fleetsep <- state_surv_fleetsep |> group_split(year_pair) |>
+  setNames(map_chr(group_split(state_surv_fleetsep, year_pair), ~ unique(.x$year_pair))) |>
+  map(calculate_cumulative_survival)
+
+cumulative_national_survival_list <- national_surv |> group_split(year_pair) |>
+  setNames(map_chr(group_split(national_surv, year_pair), ~ unique(.x$year_pair))) |>
+  map(calculate_cumulative_survival)
+
+cumulative_national_survival_list_fleetsep <- national_surv_fleetsep |> group_split(year_pair) |>
+  setNames(map_chr(group_split(national_surv_fleetsep, year_pair), ~ unique(.x$year_pair))) |>
+  map(calculate_cumulative_survival)
+
+# pre-bound dataframes for state-by-state plotting
+state_cum_all <- cumulative_state_survival_list |> bind_rows(.id = "year_pair")
+state_cum_all_fleetsep <- cumulative_state_survival_list_fleetsep |> bind_rows(.id = "year_pair")
+state_ann_all <- state_surv |> filter(Age1 >= 1)
+state_ann_all_fleetsep <- state_surv_fleetsep |> filter(Age1 >= 1)
+
+# helper to split a dataframe into a named list by year_pair
+split_by_year_pair <- function(df) {
+  df |> group_split(year_pair) |>
+    setNames(map_chr(group_split(df, year_pair), ~ unique(.x$year_pair)))
+}
+
+# expose as named lists for sections that iterate by year_pair
+national_survival_list <- split_by_year_pair(national_surv)
+national_survival_list_fleetsep <- split_by_year_pair(national_surv_fleetsep)
+state_survival_list <- split_by_year_pair(state_surv)
+state_survival_list_fleetsep <- split_by_year_pair(state_surv_fleetsep)
+
+# color palette for year-pair plots
+n_pairs <- length(year_pair_levels)
+year_pair_palette <- scales::viridis_pal(option = "turbo")(n_pairs) |>
+  setNames(year_pair_levels)
+
+message("Phase 2 complete — all objects ready")
+```
+
+<!-- ============================================================ -->
+
+<!-- PHASE 3: All plots and analysis (uses Phase 2 objects only)  -->
+
+<!-- ============================================================ -->
+
+# Phase 3: National survival (cond ann and cum) plots
+
+```{r phase3-national-plots}
+national_surv |>
+  filter(Age1 >= 0) |>
+  ggplot() +
+  geom_line(aes(x = Age1, y = survival, group = VehicleClass, color = VehicleClass)) +
+  facet_grid(cols = vars(year_pair), rows = vars(regtype)) +
+  labs(y = "Annual Conditional Survival (ratio of vehicles in CY 2 of age X+1\nrelative to vehicles in CY 1 of age X)",
+       title = "Empirical U.S. LDV conditional survival rates (year-over-year) for 2014-2025",
+       caption = "Source: Derived from Experian vehicle registration data, by Arthur Yip, NLR",
+       x = "Age in year 1")
+
+ggsave("c:/users/ayip/OneDrive - NREL (1)/survival and uvm/ann_surv_1425.png", width = 10, height = 8)
+
+national_surv_fleetsep |>
+  filter(Age1 >= 0) |>
+  ggplot() +
+  geom_line(aes(x = Age1, y = survival, group = VehicleClass, color = VehicleClass)) +
+  facet_grid(cols = vars(year_pair), rows = vars(regtype)) +
+  labs(y = "Annual Conditional Survival (ratio of vehicles in CY 2 of age X+1\nrelative to vehicles in CY 1 of age X)",
+       title = "Empirical U.S. LDV conditional survival rates (year-over-year) for 2014-2025",
+       caption = "Source: Derived from Experian vehicle registration data, by Arthur Yip, NLR",
+       x = "Age in year 1")
+
+ggsave("c:/users/ayip/OneDrive - NREL (1)/survival and uvm/ann_surv_1425_fleetsep.png", width = 10, height = 8)
+
+
+(cumulative_national_survival_list |>
+  bind_rows(.id = "year_pair") |>
+  ggplot() +
+  geom_line(aes(x=Age1, y=cumulative_survival, group=VehicleClass, color=VehicleClass), linewidth=1.2) +
+
+  geom_line(
+    data = national_aggregate_allyears,
+    mapping = aes(x=Age1, y=cumulative_survival, group=VehicleClass, color=VehicleClass),
+    linetype = "dashed",
+    linewidth = 1
+    ) +
+
+  facet_grid(cols = vars(year_pair), rows = vars(regtype)) +
+  scale_y_continuous(limits = c(0,1.5)) +
+  labs(y = "Cumulative survival rate",
+       title = "Empirical U.S. LDV survival curves for 2014-2025",
+       subtitle = "Dashes: national average (excluding 20-21 and 22-23)",
+       x = "Age in year 1")) /
+  (cumulative_national_survival_list_fleetsep |>
+  bind_rows(.id = "year_pair") |>
+  ggplot() +
+  geom_line(aes(x=Age1, y=cumulative_survival, group=VehicleClass, color=VehicleClass), linewidth=1.2) +
+
+    geom_line(
+    data = national_aggregate_allyears_fleetsep,
+    mapping = aes(x=Age1, y=cumulative_survival, group=VehicleClass, color=VehicleClass),
+    linetype = "dashed",
+    linewidth = 1
+    ) +
+
+  facet_grid(cols = vars(year_pair), rows = vars(regtype)) +
+  scale_y_continuous(limits = c(0,1.5)) +
+  labs(y = "Cumulative survival rate",
+       caption = "Source: Derived from Experian vehicle registration data, by Arthur Yip, NLR",
+       x = "Age in year 1"))
+
+ggsave("c:/users/ayip/OneDrive - NREL (1)/survival and uvm/cum_surv_1425.png", width = 10, height = 8)
+
+
+
+  
+# ── Dependencies: national_surv, year_pair_levels from Phase 2 ────────────────
+outlier_pairs  <- c("20202021", "20222023")
+normal_pairs   <- setdiff(year_pair_levels, outlier_pairs)
+n_normal       <- length(normal_pairs)
+normal_colors  <- scales::viridis_pal(option = "turbo")(n_normal) |> setNames(normal_pairs)
+outlier_colors <- c("20202021" = "black", "20222023" = "grey40")
+all_colors     <- c(normal_colors, outlier_colors)[year_pair_levels]
+normal_linetypes  <- rep("solid", n_normal) |> setNames(normal_pairs)
+outlier_linetypes <- c("20202021" = "dashed", "20222023" = "dotted")
+all_linetypes     <- c(normal_linetypes, outlier_linetypes)[year_pair_levels]
+
+out_dir <- "c:/users/ayip/OneDrive - NREL (1)/survival and uvm"
+
+compute_cumulative <- function(df) {
+  df |>
+    filter(Age1 >= 1) |>
+    group_by(year_pair) |>
+    arrange(year_pair, Age1) |>
+    mutate(cumulative_survival = cumprod(survival)) |>
+    ungroup()
+}
+
+plot_national_cum_survival <- function(df, title_label, filename) {
+  plot_df <- df |>
+    mutate(year_pair = factor(year_pair, levels = year_pair_levels))
+
+  p <- ggplot(plot_df, aes(x = Age1, y = cumulative_survival,
+                            color = year_pair, linetype = year_pair,
+                            group = year_pair)) +
+    geom_line(linewidth = 0.8) +
+    scale_color_manual(values = all_colors, name = "Year pair") +
+    scale_linetype_manual(values = all_linetypes, name = "Year pair") +
+    scale_x_continuous(breaks = seq(0, 50, 5), limits = c(0, 50)) +
+    scale_y_continuous(breaks = seq(0, 1.5, 0.1), limits = c(0, 1.5)) +
+    labs(
+      title = paste0("National ", title_label, " Cumulative Net Survival: 2015-2025"),
+      x = "Vehicle Age",
+      y = "Cumulative Net Survival Rate"
+    ) +
+    theme_minimal() +
+    theme(
+      panel.grid.minor = element_blank(),
+      plot.title = element_text(hjust = 0.5, size = 13),
+      legend.position = "right"
+    )
+
+  ggsave(file.path(out_dir, filename), plot = p, width = 10, height = 7)
+  message("  Saved: ", filename)
+  p
+}
+
+for (vc in c("Car", "SUV", "Pickup")) {
+  vc_label <- case_when(vc == "Car" ~ "Passenger Car",
+                        vc == "SUV" ~ "SUV",
+                        vc == "Pickup" ~ "Pickup Truck")
+  df <- national_surv |> filter(VehicleClass == vc) |> compute_cumulative()
+  print(plot_national_cum_survival(
+    df, vc_label,
+    paste0("national_cum_net_surv_", str_to_lower(vc), "_byyearpair.png")
+  ))
+}
+
+national_combined <- national_surv |>
+  filter(!is.na(VehicleClass)) |>
+  group_by(year_pair, Age1) |>
+  summarize(CY1 = sum(CY1, na.rm = TRUE), CY2 = sum(CY2, na.rm = TRUE), .groups = "drop") |>
+  mutate(survival = CY2 / CY1) |>
+  compute_cumulative()
+
+print(plot_national_cum_survival(
+  national_combined,
+  "Light-duty Vehicle (Combined)",
+  "national_cum_net_surv_combined_byyearpair.png"
+))
+
+  
+```
+
+# National and State Conditional Annual Survival Rates scatterplot (by vehicle class)
+
+```{r}
+library(plotly)
+
+state_plot_df <- state_surv |>
+  filter(Age1 >= 1, !is.na(VehicleClass)) |>
+  mutate(label = paste0(state_name, " | ", year_pair, " | ", VehicleClass,
+                        "\nAge: ", Age1, " | Survival: ", round(survival, 3)))
+
+national_plot_df <- national_surv |>
+  filter(Age1 >= 1, !is.na(VehicleClass)) |>
+  mutate(label = paste0("USA | ", year_pair, " | ", VehicleClass,
+                        "\nAge: ", Age1, " | Survival: ", round(survival, 3)))
+
+p <- ggplot() +
+  geom_point(
+    data = state_plot_df,
+    aes(x = Age1, y = survival, shape = VehicleClass, text = label),
+    color = "grey70", size = 1, alpha = 0.5
+  ) +
+  geom_point(
+    data = national_plot_df,
+    aes(x = Age1, y = survival, shape = VehicleClass, text = label),
+    color = "black", size = 1.5
+  ) +
+  scale_shape_manual(values = c("Car" = 16, "SUV" = 17, "Pickup" = 15)) +
+  scale_x_continuous(breaks = seq(0, 55, 10), limits = c(0, 55)) +
+  scale_y_continuous(breaks = seq(0, 2, 0.2), limits = c(0, 2)) +
+  labs(
+    title = "National and State Conditional Annual Survival Rates: 2014-2025, Light-duty Vehicles",
+    x = "Age",
+    y = "Survival Rate",
+    shape = "Vehicle Class",
+    caption = "Source: Derived from Experian registration data, by Arthur Yip, NREL"
+  ) +
+  theme_minimal() +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title = element_text(hjust = 0.5, size = 12)
+  )
+
+interactive_p <- ggplotly(p, tooltip = "text")
+interactive_p
+
+htmlwidgets::saveWidget(
+  interactive_p,
+  file = "c:/users/ayip/OneDrive - NREL (1)/survival and uvm/national_state_ann_surv_byclass.html",
+  selfcontained = TRUE
+)
+
+ggsave("c:/users/ayip/OneDrive - NREL (1)/survival and uvm/national_state_ann_surv_byclass.png",
+       plot = p, width = 10, height = 7)
+```
+
+# state geofacet (Cars, SUV, Pickup — all years overlaid)
+
+```{r}
+for (vc in c("Car", "SUV", "Pickup")) {
+  p <- cumulative_state_survival_list |>
+    bind_rows(.id = "year_pair") |>
+    filter(VehicleClass == vc) |>
+    mutate(year_pair = factor(year_pair, levels = year_pair_levels)) |>
+    ggplot(aes(x = Age1, y = cumulative_survival, color = year_pair, group = year_pair)) +
+    geom_line(alpha = 0.6, linewidth = 0.7) +
+    geom_line(
+      data = national_aggregate_allyears |> filter(VehicleClass == vc),
+      aes(x = Age1, y = cumulative_survival, group = 1),
+      col = "black", linewidth = 1, linetype = "dashed", inherit.aes = FALSE
+    ) +
+    scale_color_manual(values = year_pair_palette, name = "Year pair") +
+    scale_x_continuous(limits = c(NA, 30)) +
+    geofacet::facet_geo(facets = "state_name", grid = geofacet::us_state_grid3, label = "name") +
+    scale_y_continuous(limits = c(0, 1.5)) +
+    guides(color = guide_legend(nrow = 1)) +
+    labs(
+      y = "Cumulative net survival rate",
+      x = "Vehicle age",
+      title = paste0("Cumulative net survival rates for ", vc, "s by state (colored) and national long-term average (excl 20-21 and 22-23) (black dashes)"),
+      subtitle = "",
+      caption = "Source: Derived from Experian registration data, by Arthur Yip, NLR"
+    ) +
+    theme(legend.position = "bottom")
+
+  print(p)
+
+  ggsave(
+    paste0("c:/users/ayip/OneDrive - NREL (1)/survival and uvm/cum_surv_", str_to_lower(vc), "_bystate_14to25_allyears.png"),
+    plot = p, width = 14, height = 10
+  )
+}
+
+```
+
+# state geofacet animated (Cars, SUV, Pickup)
+
+```{r}
+library(gganimate)
+library(gifski)
+
+out_dir_anim <- "c:/users/ayip/OneDrive - NREL (1)/survival and uvm"
+
+year_pairs <- names(cumulative_state_survival_list)
+
+for (vc in c("Car", "SUV", "Pickup")) {
+  # --- build per-year-pair frames ---
+  state_df <- cumulative_state_survival_list |>
+    bind_rows(.id = "year_pair") |>
+    filter(VehicleClass == vc) |>
+    mutate(frame = year_pair)
+
+  nat_df <- cumulative_national_survival_list |>
+    bind_rows(.id = "year_pair") |>
+    ungroup() |>
+    select(-state_name, -county_name) |>
+    filter(VehicleClass == vc) |>
+    mutate(frame = year_pair)
+
+  agg_df <- national_aggregate_allyears |>
+    filter(VehicleClass == vc)
+
+  # --- build "All years" overlay frame ---
+  state_all <- cumulative_state_survival_list |>
+    bind_rows(.id = "year_pair") |>
+    filter(VehicleClass == vc) |>
+    mutate(frame = "All years")
+
+  nat_all <- cumulative_national_survival_list |>
+    bind_rows(.id = "year_pair") |>
+    ungroup() |>
+    select(-state_name, -county_name) |>
+    filter(VehicleClass == vc) |>
+    mutate(frame = "All years")
+
+  # combine single-year + all-years frames
+  state_combined <- bind_rows(state_df, state_all) |>
+    mutate(frame = factor(frame, levels = c(year_pairs, "All years")))
+
+  nat_combined <- bind_rows(nat_df, nat_all) |>
+    mutate(frame = factor(frame, levels = c(year_pairs, "All years")))
+
+  # agg dashed line appears on every frame
+  agg_expanded <- tidyr::expand_grid(frame = levels(state_combined$frame), agg_df) |>
+    mutate(frame = factor(frame, levels = levels(state_combined$frame)))
+
+  p <- state_combined |>
+    ggplot(aes(x = Age1, y = cumulative_survival, group = interaction(year_pair, frame))) +
+    geom_line(color = "red", alpha = 0.4) +
+    geom_line(
+      data = nat_combined,
+      aes(x = Age1, y = cumulative_survival, group = interaction(year_pair, frame)),
+      color = "black", alpha = 0.4
+    ) +
+    geom_line(
+      data = agg_expanded,
+      aes(x = Age1, y = cumulative_survival, group = 1),
+      color = "black", linewidth = 1, linetype = "dashed"
+    ) +
+    geofacet::facet_geo(facets = "state_name", grid = geofacet::us_state_grid3, label = "name") +
+    scale_y_continuous(limits = c(0, 1.5)) +
+    labs(
+      y = "Cumulative survival rate",
+      x = "Vehicle age",
+      title = paste0("Cumulative survival — ", vc, "s — {closest_state}"),
+      subtitle = "State (red), national year-pair (black), national all-year avg (dashed)",
+      caption = "Source: Derived from Experian registration data, by Arthur Yip, NLR"
+    ) +
+    transition_states(frame, transition_length = 1, state_length = 3) +
+    ease_aes("linear")
+
+  anim <- animate(
+    p,
+    nframes = (length(year_pairs) + 1) * 5,
+    fps = 5,
+    width = 1400, height = 1000, res = 100,
+    renderer = gifski_renderer()
+  )
+
+  anim_save(
+    file.path(out_dir_anim, paste0("cum_surv_", str_to_lower(vc), "_bystate_animated.gif")),
+    animation = anim
+  )
+
+  message("Saved animation for ", vc)
+}
+```
+
+# state geofacet (all combinations)
+
+```{r}
+year_pairs <- names(cumulative_state_survival_list)
+classes <- c("Car", "SUV", "Pickup")
+out_dir <- "c:/users/ayip/OneDrive - NREL (1)/survival and uvm/plots_by_pair_class"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+for (yp in year_pairs) {
+  for (vc in classes) {
+    message("Rendering: ", yp, " - ", vc)
+    # cumulative (state)
+    state_cum <- cumulative_state_survival_list[[yp]] %>% filter(VehicleClass == vc)
+    nat_cum <- cumulative_national_survival_list[[yp]] %>% filter(VehicleClass == vc) %>% ungroup() %>% select(-state_name, -county_name)
+    agg_cum <- national_aggregate_allyears %>% filter(VehicleClass == vc) # multi-year aggregate (dashed)
+    if (nrow(state_cum) > 0) {
+      p1 <- state_cum %>%
+        ggplot(aes(x = Age1, y = cumulative_survival, group = state_name)) +
+        geom_line(color = "red", alpha = 0.35) +
+        geom_line(data = nat_cum, aes(x = Age1, y = cumulative_survival, group = 1), color = "black", alpha = 0.7) +
+        geom_line(data = agg_cum, aes(x = Age1, y = cumulative_survival, group = 1), color = "black", linetype = "dashed", linewidth = 1) +
+        geofacet::facet_geo(facets = "state_name", grid = geofacet::us_state_grid3, label = "name") +
+        scale_y_continuous(limits = c(0, 1.5)) +
+        labs(
+          title = paste("Cumulative survival —", vc, " —", yp),
+          x = "Vehicle age",
+          y = "Cumulative survival",
+          subtitle = "State curves (red); national (solid black); multi-year aggregate (dashed)"
+        )
+      fname1 <- file.path(out_dir, str_c("cum_", yp, "_", str_to_lower(vc), ".png"))
+      ggsave(fname1, p1, width = 14, height = 10)
+    } else {
+      message("  skipping cumulative: no rows for ", yp, " ", vc)
+    }
+
+    # annual conditional survival (state)
+    state_ann <- state_survival_list[[yp]] %>% filter(VehicleClass == vc)
+    nat_ann <- national_survival_list[[yp]] %>% filter(VehicleClass == vc) %>% ungroup() %>% select(-state_name, -county_name)
+    if (nrow(state_ann) > 0) {
+      p2 <- state_ann %>%
+        ggplot(aes(x = Age1, y = survival, group = state_name)) +
+        geom_line(color = "blue", alpha = 0.35) +
+        geom_line(data = nat_ann, aes(x = Age1, y = survival, group = 1), color = "black", alpha = 0.8) +
+        geofacet::facet_geo(facets = "state_name", grid = geofacet::us_state_grid3, label = "name") +
+        scale_y_continuous(limits = c(0, 1.5)) +
+        labs(
+          title = paste("Annual conditional survival —", vc, " —", yp),
+          x = "Vehicle age",
+          y = "Annual conditional survival",
+          subtitle = "State curves (blue); national (black)"
+        )
+      fname2 <- file.path(out_dir, str_c("ann_", yp, "_", str_to_lower(vc), ".png"))
+      ggsave(fname2, p2, width = 14, height = 10)
+    } else {
+      message("  skipping annual: no rows for ", yp, " ", vc)
+    }
+  }
+}
+```
+
+# state by state
+
+```{r}
+plot_state_cum_survival <- function(st) {
+  safe_name <- st |> str_replace_all("\\s+", "_") |> str_replace_all("[^A-Za-z0-9_]", "")
+  out_file <- file.path("c:/users/ayip/OneDrive - NREL (1)/survival and uvm/", paste0(safe_name, "_survival_14to25.png"))
+
+  p <- (state_cum_all |>
+    filter(state_name == st) |>
+    ggplot() +
+    geom_line(aes(x = Age1, y = cumulative_survival, group = VehicleClass, color = VehicleClass)) +
+    geom_line(
+      data = national_aggregate_allyears,
+      mapping = aes(x = Age1, y = cumulative_survival, group = VehicleClass, color = VehicleClass),
+      linetype = "dashed", linewidth = 1.5
+    ) +
+    facet_grid(cols = vars(year_pair), rows = vars(regtype)) +
+    scale_y_continuous(limits = c(0, 1.5)) +
+    scale_x_continuous(limits = c(0, 30)) +
+    labs(
+      y = "Cumulative survival rate",
+      title = paste0("Empirical ", st, " LDV survival curves for 2014-2025"),
+      subtitle = "National survival curves in dashes",
+      x = "Age in year 1"
+    )) /
+  (state_cum_all_fleetsep |>
+    filter(state_name == st) |>
+    ggplot() +
+    geom_line(aes(x = Age1, y = cumulative_survival, group = VehicleClass, color = VehicleClass)) +
+    geom_line(
+      data = national_aggregate_allyears_fleetsep,
+      mapping = aes(x = Age1, y = cumulative_survival, group = VehicleClass, color = VehicleClass),
+      linetype = "dashed", linewidth = 1.5
+    ) +
+    facet_grid(cols = vars(year_pair), rows = vars(regtype)) +
+    scale_y_continuous(limits = c(0, 1.5)) +
+    scale_x_continuous(limits = c(0, 30)) +
+    labs(
+      y = "Cumulative survival rate",
+      caption = "Source: Derived from Experian registration data, by Arthur Yip, NLR",
+      x = "Age in year 1"
+    ))
+
+  ggsave(out_file, plot = p, width = 14, height = 10)
+  out_file
+}
+
+# Run for all states:
+states_to_plot <- state_cum_all |> distinct(state_name) |> pull(state_name) |> na.omit()
+# Or run for a subset:
+# states_to_plot <- c("California", "Texas", "New York", "Arizona", "New Mexico", "Oklahoma", "Tennessee", "Delaware")
+
+out_files <- map_chr(states_to_plot, plot_state_cum_survival)
+
+```
+
+# Annual conditional survival geofacet (Cars, SUV, Pickup — all years overlaid)
+
+```{r}
+for (vc in c("Car", "SUV", "Pickup")) {
+  p <- state_survival_list |>
+    bind_rows(.id = "year_pair") |>
+    filter(VehicleClass == vc, Age1 >= 1) |>
+    mutate(year_pair = factor(year_pair, levels = year_pair_levels)) |>
+    ggplot(aes(x = Age1, y = survival, color = year_pair, group = year_pair)) +
+    geom_line(alpha = 0.6, linewidth = 0.7) +
+    geom_line(
+      data = national_aggregate_allyears |> filter(VehicleClass == vc),
+      aes(x = Age1, y = survival, group = 1),
+      col = "black", linewidth = 1, linetype = "dashed", inherit.aes = FALSE
+    ) +
+    scale_color_manual(values = year_pair_palette, name = "Year pair") +
+    scale_x_continuous(limits = c(NA, 30)) +
+    geofacet::facet_geo(facets = "state_name", grid = geofacet::us_state_grid3, label = "name") +
+    scale_y_continuous(limits = c(0.7, 1.2)) +
+    guides(color = guide_legend(nrow = 1)) +
+    labs(
+      y = "Annual conditional survival rate",
+      x = "Vehicle age",
+      title = paste0("Annual conditional survival rates for ", vc, "s by state (colored) and national long-term average (excl 20-21 and 22-23) (black dashes)"),
+      subtitle = "",
+      caption = "Source: Derived from Experian registration data, by Arthur Yip, NLR"
+    ) +
+    theme(legend.position = "bottom")
+
+  print(p)
+
+  ggsave(
+    paste0("c:/users/ayip/OneDrive - NREL (1)/survival and uvm/ann_surv_", str_to_lower(vc), "_bystate_14to25_allyears.png"),
+    plot = p, width = 14, height = 10
+  )
+}
+```
+
+# Annual conditional survival — state by state
+
+```{r}
+plot_state_ann_survival <- function(st) {
+  safe_name <- st |> str_replace_all("\\s+", "_") |> str_replace_all("[^A-Za-z0-9_]", "")
+  out_file <- file.path("c:/users/ayip/OneDrive - NREL (1)/survival and uvm/", paste0(safe_name, "_ann_survival_14to25.png"))
+
+  p <- (state_ann_all |>
+    filter(state_name == st) |>
+    ggplot() +
+    geom_line(aes(x = Age1, y = survival, group = VehicleClass, color = VehicleClass)) +
+    geom_line(
+      data = national_aggregate_allyears,
+      mapping = aes(x = Age1, y = survival, group = VehicleClass, color = VehicleClass),
+      linetype = "dashed", linewidth = 1.5
+    ) +
+    facet_grid(cols = vars(year_pair), rows = vars(regtype)) +
+    scale_y_continuous(limits = c(0.8, 1.1)) +
+    scale_x_continuous(limits = c(0, 30)) +
+    labs(
+      y = "Annual conditional survival rate",
+      title = paste0("Empirical ", st, " LDV annual conditional survival for 2014-2025"),
+      subtitle = "National survival curves in dashes",
+      x = "Age in year 1"
+    )) /
+  (state_ann_all_fleetsep |>
+    filter(state_name == st) |>
+    ggplot() +
+    geom_line(aes(x = Age1, y = survival, group = VehicleClass, color = VehicleClass)) +
+    geom_line(
+      data = national_aggregate_allyears_fleetsep,
+      mapping = aes(x = Age1, y = survival, group = VehicleClass, color = VehicleClass),
+      linetype = "dashed", linewidth = 1.5
+    ) +
+    facet_grid(cols = vars(year_pair), rows = vars(regtype)) +
+    scale_y_continuous(limits = c(0.8, 1.1)) +
+    scale_x_continuous(limits = c(0, 30)) +
+    labs(
+      y = "Annual conditional survival rate",
+      caption = "Source: Derived from Experian registration data, by Arthur Yip, NLR",
+      x = "Age in year 1"
+    ))
+
+  ggsave(out_file, plot = p, width = 14, height = 10)
+  out_file
+}
+
+# Run for all states:
+# states_to_plot_ann <- state_ann_all |> distinct(state_name) |> pull(state_name) |> na.omit()
+# Or run for a subset:
+states_to_plot_ann <- c("Vermont", "Virginia", "Washington", "West Virginia", "Wisconsin", "Wyoming")
+
+out_files_ann <- map_chr(states_to_plot_ann, plot_state_ann_survival)
+```
+
+# STATE (for one year pair)
+
+```{r plot-state-survival}
+library(geofacet)
+
+state_survival_list %>%
+  bind_rows(.id = "year_pair") %>%
+  filter(Age1 >= 0) %>% # & Age1 <= 50) %>%
+  filter(VehicleClass == "Car") %>%
+  filter(year_pair == "20202021") %>%
+  ggplot() +
+  geom_line(aes(x=Age1, y=survival),
+            col = "red") + #, group=VehicleClass, color=VehicleClass)) +
+  labs(y = "Annual Conditional Survival (ratio of vehicles in CY 2 of age X+1\nrelative to vehicles in CY 1 of age X)") +
+  facet_geo(facets = "state_name", grid = us_state_grid3, label = "name") +
+  geom_line(data = national_survival_list[["20202021"]] %>% 
+              filter(Age1 >= 0) %>% # & Age2018 <= 49) %>%
+              filter(VehicleClass == "Car"),
+            mapping = aes(x=Age1, y=survival),
+            col = "black") #, group=VehicleClass, color=VehicleClass))
+
+
+cumulative_state_survival %>% 
+  ungroup() %>%
+  filter(VehicleClass == "Car") %>%
+  ggplot() +
+  facet_geo(facets = "state_name", grid = us_state_grid3, label = "name") +
+  geom_line(aes(x=Age2018, y=cumulative_survival), 
+            col = "red") +
+  labs(y = "Cumulative survival rates for cars by state",
+       x = "Vehicle age",
+       title = "Cumulative survival rates for cars by state (red) and national (black)",
+       subtitle = "based on observed differences in CY2019 and CY2018 vehicle stocks",
+       caption = "Source: Derived from Experian registration data, via Arthur Yip, NREL") +
+  geom_line(data = cumulative_national_survival %>% 
+              filter(VehicleClass == "Car"),
+            mapping = aes(x=Age2018, y=cumulative_survival),
+            col = "black")
+
+ggsave("c:/users/ayip/OneDrive - NREL (1)/survival and uvm/cum_surv_by_state_cars_1819.png", width = 10, height = 8)
+
+
+cumulative_state_survival %>% 
+  ungroup() %>%
+  filter(VehicleClass == "SUV") %>%
+  ggplot() +
+  facet_geo(facets = "state_name", grid = us_state_grid3, label = "name") +
+  geom_line(aes(x=Age2018, y=cumulative_survival), 
+            col = "blue") +
+  labs(y = "Cumulative survival rates for SUVs by state",
+       x = "Vehicle age",
+       title = "Cumulative survival rates for SUVs by state (blue) and national (black)",
+       subtitle = "based on observed differences in CY2019 and CY2018 vehicle stocks",
+       caption = "Source: Derived from Experian registration data, via Arthur Yip, NREL") +
+  geom_line(data = cumulative_national_survival %>% 
+              filter(VehicleClass == "SUV"),
+            mapping = aes(x=Age2018, y=cumulative_survival),
+            col = "black")
+
+ggsave("c:/users/ayip/OneDrive - NREL (1)/survival and uvm/cum_surv_by_state_SUVs_1819.png", width = 10, height = 8)
+
+
+cumulative_state_survival %>% 
+  ungroup() %>%
+  filter(VehicleClass == "Pickup") %>%
+  ggplot() +
+  facet_geo(facets = "state_name", grid = us_state_grid3, label = "name") +
+  geom_line(aes(x=Age2018, y=cumulative_survival), 
+            col = "orange") +
+  labs(y = "Cumulative survival rates for light-duty pickup trucks by state",
+       x = "Vehicle age",
+       title = "Cumulative survival rates for light-duty pickup trucks by state (orange) and national (black)",
+       subtitle = "based on observed differences in CY2019 and CY2018 vehicle stocks",
+       caption = "Source: Derived from Experian registration data, via Arthur Yip, NREL") +
+  geom_line(data = cumulative_national_survival %>% 
+              filter(VehicleClass == "Pickup"),
+            mapping = aes(x=Age2018, y=cumulative_survival),
+            col = "black")
+
+ggsave("c:/users/ayip/OneDrive - NREL (1)/survival and uvm/cum_surv_by_state_pus_1819.png", width = 10, height = 8)
+
+
+
+
+```
+
+# COUNTY
+
+```{r fig.width = 6, fig.height = 12}
+library(geofacet)
+
+county_survival <- exp1819 %>%
+  filter(!is.na(VehicleClass)) %>%
+  group_by(FIPS_5, county_name, state_name, Age2018, VehicleClass, CY) %>% # lump all else e.g. fuel type, I/O/F
+  summarize(stock = sum(stock, na.rm=T)) %>%
+  pivot_wider(names_from = "CY", values_from = "stock", names_prefix = "CY") %>%
+  mutate(survival = CY2019/CY2018)
+  
+cumulative_county_survival <- county_survival %>% 
+  filter(Age2018 >= 1) %>%
+  group_by(FIPS_5, county_name, state_name, VehicleClass) %>%
+  arrange(FIPS_5, VehicleClass, Age2018) %>%
+  mutate(cumulative_survival = cumprod(survival))
+
+cumulative_county_survival %>% 
+  ungroup() %>%
+  filter(VehicleClass == "Car") %>%
+  filter(state_name == "California") %>%
+  filter(cumulative_survival <= 2) %>%
+  ggplot() +
+  facet_geo(facets = "county_name", grid = us_ca_counties_grid1, label = "name") +
+  geom_line(aes(x=Age2018, y=cumulative_survival), 
+            col = "red") +
+  labs(y = "Cumulative survival rates for cars by county in California",
+       x = "Vehicle age",
+       title = "Cumulative survival rates for cars by county (red), state (purple), and national (black)",
+       subtitle = "based on observed differences in CY2019 and CY2018 vehicle stocks",
+       caption = "Source: Derived from Experian registration data, via Arthur Yip, NREL") +
+  geom_line(data = cumulative_national_survival %>% 
+              filter(VehicleClass == "Car"),
+            mapping = aes(x=Age2018, y=cumulative_survival),
+            col = "black") +
+    geom_line(data = cumulative_state_survival %>% 
+              filter(VehicleClass == "Car") %>%
+                filter(state_name == "California"),
+            mapping = aes(x=Age2018, y=cumulative_survival),
+            col = "purple")
+
+ggsave("c:/users/ayip/OneDrive - NREL (1)/survival and uvm/cum_surv_by_county_CA_cars_1819.png", width = 8, height = 12)
+
+
+cumulative_county_survival %>% 
+  ungroup() %>%
+  filter(VehicleClass == "SUV") %>%
+  filter(state_name == "California") %>%
+  filter(cumulative_survival <= 2) %>%
+  ggplot() +
+  facet_geo(facets = "county_name", grid = us_ca_counties_grid1, label = "name") +
+  geom_line(aes(x=Age2018, y=cumulative_survival), 
+            col = "blue") +
+  labs(y = "Cumulative survival rates for SUVs by county in California",
+       x = "Vehicle age",
+       title = "Cumulative survival rates for SUVs by county (blue), state (purple), and national (black)",
+       subtitle = "based on observed differences in CY2019 and CY2018 vehicle stocks",
+       caption = "Source: Derived from Experian registration data, via Arthur Yip, NREL") +
+  geom_line(data = cumulative_national_survival %>% 
+              filter(VehicleClass == "SUV"),
+            mapping = aes(x=Age2018, y=cumulative_survival),
+            col = "black") +
+      geom_line(data = cumulative_state_survival %>% 
+              filter(VehicleClass == "SUV") %>%
+                filter(state_name == "California"),
+            mapping = aes(x=Age2018, y=cumulative_survival),
+            col = "purple")
+
+ggsave("c:/users/ayip/OneDrive - NREL (1)/survival and uvm/cum_surv_by_county_CA_SUVs_1819.png", width = 8, height = 12)
+
+
+cumulative_county_survival %>% 
+  ungroup() %>%
+  filter(VehicleClass == "Pickup") %>%
+  filter(state_name == "California") %>%
+  filter(cumulative_survival <= 2) %>%
+  ggplot() +
+  facet_geo(facets = "county_name", grid = us_ca_counties_grid1, label = "name") +
+  geom_line(aes(x=Age2018, y=cumulative_survival), 
+            col = "orange") +
+  labs(y = "Cumulative survival rates for light-duty pickup trucks by county in California",
+       x = "Vehicle age",
+       title = "Cumulative survival rates for light-duty pickup trucks by county (orange), state (purple), and national (black)",
+       subtitle = "based on observed differences in CY2019 and CY2018 vehicle stocks",
+       caption = "Source: Derived from Experian registration data, via Arthur Yip, NREL") +
+  geom_line(data = cumulative_national_survival %>% 
+              filter(VehicleClass == "Pickup"),
+            mapping = aes(x=Age2018, y=cumulative_survival),
+            col = "black") +
+        geom_line(data = cumulative_state_survival %>% 
+              filter(VehicleClass == "Pickup") %>%
+                filter(state_name == "California"),
+            mapping = aes(x=Age2018, y=cumulative_survival),
+            col = "purple")
+
+ggsave("c:/users/ayip/OneDrive - NREL (1)/survival and uvm/cum_surv_by_county_CA_pus_1819.png", width = 8, height = 12)
+
+
+
+```
+
+```{r}
+
+greene_stock_data_request <- data_list$`2022` %>%
+  mutate(Tech = if_else(tempo_fuel_type_with_range == "HEV", "HEV", Tech)) %>%
+  group_by(state_name, Tech, vehicle_model_year, VehicleClass) %>%
+  summarize(stock = sum(stock))
+greene_stock_data_request
+greene_stock_data_request %>% write_csv("c:/users/ayip/OneDrive - NREL (1)/survival and uvm/state_2022_stocks_with_HEV.csv")
+
+```
+
+# HI DETOUR
+
+```{r plot-HI}
+state_survival_list %>% 
+  bind_rows(.id = "year_pair") %>%
+  filter(Age1 >= 0,
+         state_name == "Hawaii") %>% # & Age1 <= 50) %>%
+  ggplot() +
+  geom_line(aes(x=Age1, y=survival, group=VehicleClass, color=VehicleClass)) +
+  facet_wrap(~year_pair) + 
+  labs(y = "Annual Conditional Survival (ratio of vehicles in CY 2 of age X+1\nrelative to vehicles in CY 1 of age X)",
+       title = "Empirical Hawaiian LDV conditional survival rates (year-over-year) for 2014-2022",
+       caption = "Source: Derived from Experian registration data, via Arthur Yip, NREL",
+       x = "Age in year 1")
+
+cumulative_state_survival_list %>% 
+  bind_rows(.id = "year_pair") %>%
+  filter(state_name == "Hawaii") %>%
+  ggplot() +
+  geom_line(aes(x=Age1, y=cumulative_survival, group=VehicleClass, color=VehicleClass)) +
+  
+  geom_line(data = cumulative_national_survival_list %>% bind_rows(.id = "year_pair"),
+            mapping = aes(x=Age1, y=cumulative_survival, group=VehicleClass, color=VehicleClass),
+            linetype = "dashed",
+            linewidth = 1.5
+            ) +
+  
+  facet_wrap(~year_pair) + 
+  scale_y_continuous(limits = c(0,1.2)) +
+  labs(y = "Cumulative survival rate",
+       title = "Empirical Hawaiian LDV survival curves for 2014-2022",
+       caption = "Source: Derived from Experian registration data, via Arthur Yip, NREL",
+       x = "Age in year 1")
+
+
+(cumulative_state_survival_list %>% 
+  bind_rows(.id = "year_pair") %>%
+    filter(state_name == "Hawaii") %>%
+  ggplot() +
+  geom_line(aes(x=Age1, y=cumulative_survival, group=VehicleClass, color=VehicleClass)) +
+    
+    #   geom_line(
+    # data = national_aggregate_allyears,
+    # mapping = aes(x=Age1, y=cumulative_survival, group=VehicleClass, color=VehicleClass),
+    # linetype = "dashed",
+    # linewidth = 1.5
+    # ) +
+    
+  facet_grid(cols = vars(year_pair), rows = vars(regtype)) + 
+  scale_y_continuous(limits = c(0,1.5)) +
+  labs(y = "Cumulative survival rate",
+       title = "Empirical Hawaii LDV survival curves for 2014-2022",
+       x = "Age in year 1")) /
+  (cumulative_state_survival_list_fleetsep %>% 
+  bind_rows(.id = "year_pair") %>%
+    filter(state_name == "Hawaii") %>%
+  ggplot() +
+  geom_line(aes(x=Age1, y=cumulative_survival, group=VehicleClass, color=VehicleClass)) +
+    
+    #     geom_line(
+    # data = national_aggregate_allyears_fleetsep,
+    # mapping = aes(x=Age1, y=cumulative_survival, group=VehicleClass, color=VehicleClass),
+    # linetype = "dashed",
+    # linewidth = 1.5
+    # ) +
+    
+  facet_grid(cols = vars(year_pair), rows = vars(regtype)) + 
+  scale_y_continuous(limits = c(0,1.5)) +
+  labs(y = "Cumulative survival rate",
+       caption = "Source: Derived from Experian registration data, via Arthur Yip, NREL",
+       x = "Age in year 1"))
+
+ggsave("c:/users/ayip/OneDrive - NREL (1)/survival and uvm/hi.png")
+
+# 2016-2017 fleet vehicles look weird in Hawaii
+# 2015-2016 too - lots of hh imports... transfers ?
+
+cumulative_state_survival_list_fleetsep[[3]] %>%
+  filter(state_name == "Hawaii", VehicleClass == "Car")
+```
+
+# HI survival for tempo
+
+```{r}
+
+HI_stateaggregate_allyears_anncondsurv <- state_survival_list %>%
+  bind_rows(.id = "yearpair") %>% 
+  #filter(yearpair != "20202021") %>%
+  filter(yearpair != "20152016" & yearpair != "20162017") %>%
+  group_by(regtype, Age1, VehicleClass) %>% 
+  summarize(CY2 = sum(CY2), CY1 = sum(CY1)) %>%
+  mutate(survival = CY2/CY1)
+
+data_for_HI_stateagg_anncondsurv_for_tempo <- HI_stateaggregate_allyears_anncondsurv %>%
+  filter(Age1 >= 0) %>%
+  mutate(Annual_Survival = if_else(survival > 1, 1, survival)) %>% 
+  ungroup() %>% 
+  select(-regtype, -CY2, -CY1)
+
+HI_stateagg_anncondsurv_for_tempo <- expand(tibble(), 
+       Mode = "Personal_LDV",  
+       Tech = c("ICEV_Gasoline", "HEV_Gasoline", "PHEV_25", "PHEV_50", "BEV_100", "BEV_300", "ICEV_NG", "FCEV"),
+       Class = c("Compact","Midsize","Pickup","SUV"),
+       Age = 0:99) %>%
+  mutate(VehicleClass = if_else(Class %in% c("Compact","Midsize"), "Car", Class),
+         Age1 = if_else(Age > 40, 40, Age)) %>%
+  left_join(data_for_HI_stateagg_anncondsurv_for_tempo, by = c("Age1", "VehicleClass")) %>%
+  select(-Age1, -VehicleClass, -survival)
+
+survival_file_for_tempo <- read_csv("C:/Users/ayip/Documents/GitHub/TMM-dev/TEMPO.jl/data/survival/vehicle-survival-ldv_bytech-jb-class.csv") %>%
+  filter(Mode != "Personal_LDV") %>%
+  bind_rows(HI_stateagg_anncondsurv_for_tempo)
+
+survival_file_for_tempo <- survival_file_for_tempo %>% mutate(Class = if_else(is.na(Class), "", Class),
+                                                              Tech = if_else(is.na(Tech), "", Tech))
+
+survival_file_for_tempo %>% filter(is.na(Mode) | is.na(Tech) | is.na(Class) | is.na(Age))
+
+survival_file_for_tempo %>% write_csv("C:/Users/ayip/Documents/GitHub/TMM-dev/TEMPO.jl/data/survival/vehicle-survival-ldv_bytech-jb-class-LDV_HI.csv")
+
+survival_file_for_tempo <- read_csv("C:/Users/ayip/Documents/GitHub/TMM-dev/TEMPO.jl/data/survival/vehicle-survival-ldv_bytech-jb-class-LDV_HI.csv")
+
+survival_file_for_tempo %>% 
+  filter(Mode == "Personal_LDV") %>%
+  filter(Age >= 1) %>%
+  group_by(Mode,Tech,Class) %>%
+  arrange(Mode,Tech,Class,Age) %>%
+  mutate(cumulative_survival = cumprod(Annual_Survival)) -> tempo_HI_surv
+
+tempo_HI_surv %>%
+  ggplot() +
+  geom_line(aes(x=Age, y=cumulative_survival, group=interaction(Mode, Tech, Class), color =interaction(Mode, Tech, Class)))
+
+```
+
+```{r}
+
+HI_aggregate_allyears <- HI_stateaggregate_allyears_anncondsurv %>%
+  filter(Age1 >= 1) %>%
+  group_by(regtype, VehicleClass) %>%
+  arrange(regtype, VehicleClass, Age1) %>%
+  mutate(cumulative_survival = cumprod(survival))
+
+
+
+HI_aggregate_allyears_fleetsep <- state_survival_list_fleetsep %>%
+  bind_rows(.id = "yearpair") %>% 
+  filter(yearpair != "20162017") %>% # yearpair != "20202021" & 
+  group_by(regtype, Age1, VehicleClass) %>% 
+  summarize(CY2 = sum(CY2), CY1 = sum(CY1)) %>%
+  mutate(survival = CY2/CY1) %>%
+  filter(Age1 >= 1) %>%
+  group_by(regtype, VehicleClass) %>%
+  arrange(regtype, VehicleClass, Age1) %>%
+  mutate(cumulative_survival = cumprod(survival))
+
+# HI plots
+# same as above
+# thick and dashed are now HI avg, not natl avg?
+
+(cumulative_state_survival_list %>% 
+  bind_rows(.id = "year_pair") %>%
+    filter(state_name == "Hawaii") %>%
+  ggplot() +
+  geom_line(aes(x=Age1, y=cumulative_survival, group=VehicleClass, color=VehicleClass)) +
+    
+    #   geom_line(
+    # data = HI_aggregate_allyears,
+    # mapping = aes(x=Age1, y=cumulative_survival, group=VehicleClass, color=VehicleClass),
+    # linetype = "dashed",
+    # linewidth = 1.5
+    # ) +
+    
+  facet_grid(cols = vars(year_pair), rows = vars(regtype)) + 
+  scale_y_continuous(limits = c(0,1.5)) +
+  labs(y = "Cumulative survival rate",
+       title = "Empirical Hawaii LDV survival curves for 2014-2022"
+       )) /
+  (cumulative_state_survival_list_fleetsep %>% 
+  bind_rows(.id = "year_pair") %>%
+    filter(state_name == "Hawaii") %>%
+  ggplot() +
+  geom_line(aes(x=Age1, y=cumulative_survival, group=VehicleClass, color=VehicleClass)) +
+    
+    #     geom_line(
+    # data = HI_aggregate_allyears_fleetsep,
+    # mapping = aes(x=Age1, y=cumulative_survival, group=VehicleClass, color=VehicleClass),
+    # linetype = "dashed",
+    # linewidth = 1.5
+    # ) +
+    
+  facet_grid(cols = vars(year_pair), rows = vars(regtype)) + 
+  scale_y_continuous(limits = c(0,1.5)) +
+  labs(y = "Cumulative survival rate",
+       caption = "Source: Derived from Experian registration data, via Arthur Yip, NREL",
+       x = "Age in year 1"))
+
+```
+
+```{r HI-county}
+HIcounty_allyears_fleetsep <- county_survival_list_fleetsep %>%
+  bind_rows(.id = "yearpair") %>% 
+  filter(yearpair != "20162017") %>% # yearpair != "20202021" & 
+  filter(state_name == "Hawaii") %>%
+  filter(county_name != "Kalawao" & county_name != "Kauai") %>%
+  group_by(regtype, county_name, Age1, VehicleClass) %>% 
+  summarize(CY2 = sum(CY2), CY1 = sum(CY1)) %>%
+  mutate(survival = CY2/CY1)
+
+HIcounty_aggregate_allyears_fleetsep <- HIcounty_allyears_fleetsep %>%
+  filter(Age1 >= 1) %>%
+  group_by(regtype, county_name, VehicleClass) %>%
+  arrange(regtype, county_name, VehicleClass, Age1) %>%
+  mutate(cumulative_survival = cumprod(survival))
+
+HIcounty_aggregate_allyears_fleetsep %>% 
+  bind_rows(.id = "year_pair") %>%
+  ggplot() +
+  geom_line(aes(x=Age1, y=cumulative_survival, group=VehicleClass, color=VehicleClass)) +
+    
+  geom_line(
+    data = national_aggregate_allyears %>% ungroup() %>% select(-regtype),
+    mapping = aes(x=Age1, y=cumulative_survival, group=VehicleClass, color=VehicleClass),
+    linetype = "dashed",
+    linewidth = 1.5
+    #color = "black"
+    ) +
+      
+  facet_grid(cols = vars(county_name, regtype), rows = vars(VehicleClass)) + # cols = vars(year_pair), 
+  scale_y_continuous(limits = c(0,1.5)) +
+  labs(y = "Cumulative survival rate",
+       title = "Empirical Hawaii LDV survival curves (dashed = national average)",
+       x = "Age in year 1")
+
+```
+
+# Reconciliation of Greene net import/export by state, weighted by vehicle counts by states
+
+To see if they add up
+
+```{r}
+# greene_intermediate already loaded from CSV in Phase 2
+
+greene_intermediate |> head()
+
+greene_intermediate |>
+  group_by(VehType) %>%
+  summarize(national_net_mean1421 = sum(NetImpExpMean1421_stock, na.rm=T),
+            national_net_mean1519 = sum(NetImpExpMean1519_stock, na.rm=T),
+            national_net_19 = sum(NetImpExp19_stock, na.rm=T),
+            national_net_18 = sum(NetImpExp18_stock, na.rm=T),
+            national_net_17 = sum(NetImpExp17_stock, na.rm=T),
+            national_net_16 = sum(NetImpExp16_stock, na.rm=T),
+            national_net_15 = sum(NetImpExp15_stock, na.rm=T),
+            national_stock = sum(stock * 0.93, na.rm=T)) %>%
+  mutate(pct_net = national_net_mean1519/national_stock)
+
+```
+
+```{r}
+library(tidyverse)
+library(leaflet)
+library(sf)
+library(tigris) # Provides easy access to US Census shapefiles
+library(RColorBrewer) # Provides color palettes
+options(tigris_use_cache = TRUE) # Cache shapefiles for future use
+#library(mapview)
+
+# 1. Load data
+#greene_intermediate <- greene_intermediate
+
+for (VehTypeCurrent in c("Pickup", "SUV", "Car")) {
+
+# 2. Get US states spatial data
+# Use the tigris package to get state boundaries, including shifted AK/HI insets
+states_sf <- states(cb = TRUE, resolution = "20m") %>%
+  filter(!STUSPS %in% c("PR", "VI", "GU", "AS", "MP")) %>%
+  rename(STNAME = NAME) %>% 
+  left_join(greene_intermediate %>% filter(VehType == VehTypeCurrent), by = "STNAME") %>% 
+  arrange(STNAME)
+
+# contiguous <- states_sf %>% filter(!STNAME %in% c("Alaska", "Hawaii"))
+# alaska <- states_sf %>% filter(STNAME == "Alaska")
+# hawaii <- states_sf %>% filter(STNAME == "Hawaii")
+# 
+# # Transform Alaska
+# alaska_transformed <- alaska %>%
+#   st_transform(3338) %>%  # Alaska Albers
+#   st_geometry() %>%
+#   st_cast("MULTIPOLYGON") %>%
+#   `*`(0.35) %>%  # Scale to 35%
+#   `+`(c(-1500000, -4300000)) %>%  # Move position
+#   st_set_crs(3338) %>%
+#   st_transform(st_crs(states_sf))
+# 
+# alaska$geometry <- alaska_transformed
+# 
+# # Transform Hawaii  
+# hawaii_transformed <- hawaii %>%
+#   st_transform(4135) %>%  # Hawaii projection
+#   st_geometry() %>%
+#   st_cast("MULTIPOLYGON") %>%
+#   `*`(1.5) %>%  # Scale to 150%
+#   `+`(c(5400000, -1400000)) %>%  # Move position
+#   st_set_crs(4135) %>%
+#   st_transform(st_crs(states_sf))
+# 
+# hawaii$geometry <- hawaii_transformed
+# 
+# # Combine back together
+# states_sf_transformed <- bind_rows(contiguous, alaska, hawaii)
+states_sf_transformed <- states_sf
+
+# 3. Define color palette and popups
+pal <- colorNumeric(
+  palette = "RdBu",
+  #domain = states_sf$NetImpExpMean1421_stock
+  domain = c(-200000, 200000)
+  )
+
+# Prepare labels for popups (using HTML for formatting)
+state_labels <- paste(
+  "<strong>", states_sf_transformed$STNAME, "</strong><br/>",
+  "Net Vehicle (Age 2-8) Import/Export: ", round(states_sf_transformed$NetImpExpMean1519_stock, 0)
+) %>% lapply(htmltools::HTML)
+
+
+# 4. Create the Leaflet map
+m <- leaflet(states_sf_transformed) %>%
+    setView(lng = -96, lat = 37.8, zoom = 4) %>%  # Center on USA
+  setMaxBounds(lng1 = -125, lat1 = 24, lng2 = -66, lat2 = 50) %>%
+  #addTiles() %>% # Add default OpenStreetMap map tiles
+  addPolygons(
+    fillColor = ~pal(NetImpExpMean1519_stock),
+    weight = 1,
+    opacity = 1,
+    color = "white",
+    dashArray = "3",
+    fillOpacity = 0.7,
+    highlightOptions = highlightOptions(
+      weight = 3,
+      color = "#666",
+      dashArray = "",
+      fillOpacity = 0.9,
+      bringToFront = TRUE),
+    label = state_labels,
+    labelOptions = labelOptions(
+      style = list("font-weight" = "normal", padding = "3px 8px"),
+      textsize = "15px",
+      direction = "auto"
+    )
+  ) %>%
+  addLabelOnlyMarkers(
+    data = states_sf_transformed,
+    lng = ~st_coordinates(st_centroid(geometry))[,1],
+    lat = ~st_coordinates(st_centroid(geometry))[,2],
+    label = ~paste0(round(states_sf_transformed$NetImpExpMean1519_stock, -2),"\n", round(states_sf_transformed$NetImpExpMean1519, 2) ,"%"), 
+    labelOptions = labelOptions(
+      noHide = TRUE,
+      direction = "center",
+      textOnly = TRUE,
+      style = list(
+        "color" = "black",
+        "font-weight" = "bold",
+        "font-size" = "12px"
+      )
+    )
+    ) %>%
+      addLegend(pal = pal, values = ~NetImpExpMean1519_stock, opacity = 0.7, title = paste("Net",VehTypeCurrent,"(Age 2-8) Import/Export"),
+            position = "bottomright") # Add legend
+
+# Display the map
+m
+
+dir.create("c:/users/ayip/OneDrive - NREL (1)/survival and uvm/est net flows", showWarnings = FALSE)
+htmlwidgets::saveWidget(m, file = paste0("c:/users/ayip/OneDrive - NREL (1)/survival and uvm/est net flows/",VehTypeCurrent,".html"), selfcontained = TRUE)
+#mapview::mapshot(m, file = paste0("c:/users/ayip/OneDrive - NREL (1)/survival and uvm/",VehTypeCurrent,".png"))
+}
+```
+
+# Sankey diagrams of net state import/export flows
+
+One Sankey per vehicle class × averaging window, using the `old` (national-weights) method — the production method per Greene's validation, see Phase 1b — from `net_imports_summary` (Phase 1b / Phase 2), plus the legacy simple-method 2015–2019 versions under their original filenames.
+
+```{r sankey-net-flows}
+library(networkD3)
+
+out_dir_sankey <- "c:/users/ayip/OneDrive - NREL (1)/survival and uvm/est net flows"
+dir.create(out_dir_sankey, showWarnings = FALSE)
+
+year_set_labels <- c(
+  yrs1519  = "2015/16–2019/20",
+  yrs1421  = "2014/15–2021/22",
+  yrs_excl = "2014/15–2024/25 excl. 20/21 & 22/23",
+  yrs_all  = "2014/15–2024/25 (all)"
+)
+method_labels <- c(
+  simple = "simple unweighted mean, ages 1-7",
+  old    = "old method: national-survival weights",
+  new    = "new method: cohort weights (hybrid pre-2020/21)"
+)
+
+# df: one row per state, columns STNAME + flow (net imports, vehicles/yr)
+make_sankey <- function(df, title_text) {
+  exporters <- df |>
+    filter(flow < 0) |>
+    mutate(flow = abs(flow)) |>
+    arrange(desc(flow))
+
+  importers <- df |>
+    filter(flow > 0) |>
+    arrange(desc(flow))
+
+  # top 15 + other
+  if (nrow(exporters) > 15) {
+    exporters <- bind_rows(
+      slice_head(exporters, n = 15),
+      tibble(STNAME = "Other exporters",
+             flow = sum(exporters$flow[16:nrow(exporters)]))
+    )
+  }
+  if (nrow(importers) > 15) {
+    importers <- bind_rows(
+      slice_head(importers, n = 15),
+      tibble(STNAME = "Other importers",
+             flow = sum(importers$flow[16:nrow(importers)]))
+    )
+  }
+
+  # gross imports as a share of gross exports across states
+  # (top-15 lumping preserves sums)
+  actual_balance <- sum(importers$flow) / sum(exporters$flow)
+
+  # labels carry the actual flows; only the drawn widths are balanced below
+  exp_labels <- paste0(exporters$STNAME, " (", scales::comma(round(exporters$flow, -2)), ")")
+  imp_labels <- paste0(importers$STNAME, " (", scales::comma(round(importers$flow, -2)), ")")
+  # short label: the balance % is already stated in the caption below the
+  # title, so the node label just needs to fit without touching the
+  # importer column - a long label here collided with node text to its right
+  pool_label <- "Net flow pool"
+
+  # force balance so the Sankey looks symmetric
+  importers <- importers |> mutate(flow = flow * (sum(exporters$flow) / sum(flow)))
+
+  nodes <- tibble(
+    name  = c(exp_labels, pool_label, imp_labels),
+    group = c(rep("exporter", nrow(exporters)), "pool", rep("importer", nrow(importers)))
+  ) |>
+    mutate(id = row_number() - 1L)
+
+  pool_id <- nodes |> filter(group == "pool") |> pull(id)
+
+  links <- bind_rows(
+    tibble(source = match(exp_labels, nodes$name) - 1L,
+           target = pool_id,
+           value  = exporters$flow),
+    tibble(source = pool_id,
+           target = match(imp_labels, nodes$name) - 1L,
+           value  = importers$flow)
+  )
+
+  color_js <- 'd3.scaleOrdinal().domain(["exporter","pool","importer"]).range(["#7b2d8e","#aaaaaa","#e67e22"])'
+
+  s <- sankeyNetwork(
+    Links = as.data.frame(links), Nodes = as.data.frame(nodes),
+    Source = "source", Target = "target", Value = "value",
+    NodeID = "name", NodeGroup = "group", colourScale = color_js,
+    fontSize = 18, fontFamily = "sans-serif",
+    nodeWidth = 20, nodePadding = 13, sinksRight = TRUE,
+    width = 900, height = 900
+  )
+
+  balance_note <- paste0(
+    "Gross imports = ", scales::percent(actual_balance, accuracy = 0.1),
+    " of gross exports across states.")
+
+  htmlwidgets::prependContent(
+    s,
+    htmltools::tags$h3(title_text, style = "text-align:center; font-family:sans-serif;"),
+    htmltools::tags$p(balance_note, style = "text-align:center; font-family:sans-serif; color:#555555;")
+  )
+}
+
+save_sankey <- function(s, stem) {
+  html_file <- file.path(out_dir_sankey, paste0(stem, ".html"))
+  png_file  <- file.path(out_dir_sankey, paste0(stem, ".png"))
+  htmlwidgets::saveWidget(s, file = html_file, selfcontained = TRUE)
+  webshot2::webshot(html_file, file = png_file, vwidth = 920, vheight = 1040, delay = 1)
+  invisible(png_file)
+}
+
+# legacy simple-method / 2015-2019 sankeys (same filenames as before)
+for (vc in c("Car", "SUV", "Pickup")) {
+  df <- greene_intermediate |>
+    filter(VehType == vc, !is.na(NetImpExpMean1519_stock)) |>
+    select(STNAME, flow = NetImpExpMean1519_stock)
+
+  s <- make_sankey(df, paste0(
+    "Net Export and Import of ", vc,
+    "s per year (age 2-8 vehicles, average movement during 2015-2019). ",
+    "Includes vehicle movements associated with both population migration and vehicle markets."))
+  save_sankey(s, paste0("sankey_net_flow_", str_to_lower(vc)))
+  message("Saved legacy Sankey for ", vc)
+}
+
+# production method (national weights) x all averaging windows
+# ("new"/cohort weights are computed in netimports-compute purely as a
+# validation check against this method - see netimports-compare - and no
+# longer get their own Sankeys)
+for (m in c("old")) {
+  for (ys in names(year_set_labels)) {
+    for (vc in c("Car", "SUV", "Pickup")) {
+      df <- net_imports_summary |>
+        filter(method == .env$m, year_set == .env$ys, VehicleClass == .env$vc,
+               !is.na(Average_stock)) |>
+        select(STNAME = statename, flow = Average_stock)
+
+      s <- make_sankey(df, paste0(
+        "Net Export and Import of ", vc, "s per year (age 2-8 vehicles; ",
+        method_labels[m], "; averaged over ", year_set_labels[ys], "). ",
+        "Includes vehicle movements associated with both population migration and vehicle markets."))
+      save_sankey(s, paste0("sankey_net_flow_", str_to_lower(vc), "_", m, "_", ys))
+      message("Saved Sankey: ", vc, " / ", m, " / ", ys)
+    }
+  }
+}
+```
+
+# Method validation and year-window comparison of net-import estimates
+
+Uses `net_imports_summary` and `net_imports_long` (Phase 2) plus `year_set_labels` / `method_labels` from the Sankey chunk. Since `old` (national weights) is the production method (see Phase 1b), the method-comparison here exists only to reproduce Greene's own national-vs-state-weights validation on our pipeline, not to pick between two live options.
+
+```{r netimports-compare}
+out_dir_cmp <- "c:/users/ayip/OneDrive - NREL (1)/survival and uvm/est net flows"
+
+method_cols <- c(old = "#2a78d6", new = "#1baf7a", simple = "#eda100")
+yearset_cols <- c(yrs1519 = "#2a78d6", yrs1421 = "#1baf7a",
+                  yrs_excl = "#eda100", yrs_all = "#008300")
+
+theme_cmp <- theme_minimal(base_size = 10) +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = "#e1e0d9", linewidth = 0.3),
+        axis.text = element_text(color = "#52514e"),
+        plot.title = element_text(size = 12),
+        plot.subtitle = element_text(color = "#52514e"),
+        legend.position = "top")
+
+# --- A. reproduce Greene's own validation: national vs state (cohort)
+# weights, 2021/22 only - the exact test he ran before deciding to keep
+# national weights. Our `old` = his "national weights"; our `new` for
+# 2021/22 = his "state rates as weights" (cohort weights use the state's
+# own survival). Fit stats are annotated per class.
+val_data <- net_imports_long |>
+  filter(year == 2021, method %in% c("old", "new")) |>
+  select(VehicleClass, statename, method, value) |>
+  pivot_wider(names_from = method, values_from = value) |>
+  filter(!is.na(old), !is.na(new))
+
+val_stats <- val_data |>
+  summarise(r2        = cor(old, new)^2,
+            slope     = cov(old, new) / var(old),
+            intercept = mean(new) - (cov(old, new) / var(old)) * mean(old),
+            n         = n(),
+            .by = VehicleClass) |>
+  mutate(label = sprintf("R^2 = %.3f\nslope = %.3f\nintercept = %.5f",
+                         r2, slope, intercept))
+
+p_validate <- val_data |>
+  left_join(val_stats, by = "VehicleClass") |>
+  ggplot(aes(x = old, y = new)) +
+  geom_abline(color = "#c3c2b7", linewidth = 0.4) +
+  geom_point(color = "#2a78d6", size = 1.4, alpha = 0.75) +
+  geom_smooth(method = "lm", formula = y ~ x, se = FALSE,
+             color = "#1baf7a", linewidth = 0.6) +
+  geom_text(aes(x = -Inf, y = Inf, label = label), data = val_stats,
+           hjust = -0.08, vjust = 1.15, size = 3, color = "#4c5a6b",
+           lineheight = 1.1) +
+  facet_wrap(vars(VehicleClass)) +
+  scale_x_continuous(labels = scales::percent) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Validation: national weights vs. state (cohort) weights, 2021/22",
+       subtitle = "Reproduces Greene's own test on our pipeline - confirms the two are statistically equivalent",
+       x = "National weights (production method)", y = "State/cohort weights") +
+  theme_cmp
+
+ggsave(file.path(out_dir_cmp, "validate_national_vs_state_weights_2021.png"),
+       plot = p_validate, width = 11, height = 4.5)
+print(p_validate)
+val_stats |> select(VehicleClass, n, r2, slope, intercept)
+
+# --- B. sensitivity to the averaging window (production method) -----------
+for (vc in c("Car", "SUV", "Pickup")) {
+  df <- net_imports_summary |>
+    filter(VehicleClass == .env$vc, method == "old")
+
+  state_order <- df |>
+    filter(year_set == "yrs_excl") |>
+    arrange(Average) |>
+    pull(statename)
+
+  p <- df |>
+    mutate(statename = factor(statename, levels = state_order)) |>
+    ggplot(aes(x = Average, y = statename, color = year_set)) +
+    geom_vline(xintercept = 0, color = "#c3c2b7", linewidth = 0.4) +
+    geom_point(size = 1.6, alpha = 0.85) +
+    scale_color_manual(values = yearset_cols, labels = year_set_labels,
+                       name = "Averaging window") +
+    scale_x_continuous(labels = scales::percent) +
+    labs(title = paste0(vc, "s: sensitivity of net import rate to averaging window"),
+         subtitle = "Production method: national weights (all yearpairs)",
+         x = "Net import rate (share of age 2-8 stock per year)", y = NULL) +
+    theme_cmp +
+    guides(color = guide_legend(nrow = 2))
+
+  ggsave(file.path(out_dir_cmp,
+                   paste0("compare_windows_", str_to_lower(vc), "_old.png")),
+         plot = p, width = 8, height = 10)
+  print(p)
+}
+
+# --- C. national reconciliation: do state flows sum to ~zero? --------------
+national_sums <- net_imports_summary |>
+  summarise(net_stock_sum = sum(Average_stock, na.rm = TRUE),
+            gross_imports = sum(pmax(Average_stock, 0), na.rm = TRUE),
+            .by = c(method, year_set, VehicleClass)) |>
+  mutate(imbalance_pct = 100 * net_stock_sum / gross_imports) |>
+  arrange(method, year_set, VehicleClass)
+
+national_sums
+
+national_sums |>
+  write_csv(file.path(out_dir_cmp, "national_reconciliation_by_method.csv"))
+```

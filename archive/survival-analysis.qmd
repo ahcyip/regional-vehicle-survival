@@ -1,0 +1,109 @@
+---
+title: "survival analysis"
+format: html
+editor: visual
+---
+
+```{r}
+library(tidyverse)
+old <- read_csv("c:/users/ayip/documents/github/tmm/TEMPO.jl/data/survival/vehicle-survival-ldv_bytech-aeo-fix-no-removals-bus.csv")
+new <- read_csv("c:/users/ayip/documents/github/tmm/TEMPO.jl/data/survival/vehicle-survival-ldv_bytech-jb-class.csv")
+
+both_survival <- bind_rows(old %>% mutate(Class = "SUV", curve = "old"),
+                           new %>% mutate(curve = "new"))
+
+both_survival %>%
+  filter(Mode == "Personal_LDV") %>%
+  ggplot() +
+  geom_line(aes(x=Age, y=Annual_Survival, col = curve)) +
+  facet_grid(Tech ~ Class)
+```
+
+```{r}
+
+HI_survival <- read_csv("C:/Users/ayip/Documents/GitHub/TMM-pjmm/TEMPO.jl/data/survival/vehicle-survival-ldv_bytech-jb-class-LDV_HI_20.csv")
+
+HI_survival %>%
+  ggplot() +
+  geom_line(aes(x=Age, y=Annual_Survival, col=Tech)) +
+  facet_grid(rows = vars(Mode), cols = vars(Class))
+
+
+HI_survival %>%
+  filter(Mode == "Bus")
+# Looks like a bus year has a 93 instead of a .93 ...
+
+reg_survival <- read_csv("C:/Users/ayip/Documents/GitHub/TMM-pjmm/TEMPO.jl/data/survival/vehicle-survival-ldv_bytech-jb-class.csv")
+reg_survival %>%
+  filter(Mode == "Bus")
+
+
+
+HI_survival %>%
+  filter(Mode == "Personal_LDV") %>%
+  ggplot() +
+  geom_line(aes(x=Age, y=Annual_Survival, col=Tech)) +
+  facet_grid(rows = vars(Tech), cols = vars(Class))
+
+```
+
+```{r}
+
+
+
+HI_survival_new <- bind_rows(
+  HI_survival %>%
+    filter(Mode != "Personal_LDV"),
+  HI_survival %>%
+    filter(Mode == "Personal_LDV", Tech == "BEV_400"),
+  HI_survival %>%
+    filter(Mode == "Personal_LDV", Tech == "ICEV_Gasoline"),
+  HI_survival %>%
+    filter(Mode == "Personal_LDV", Tech == "BEV_400") %>%
+    mutate(Tech = "BEV_200"),
+  HI_survival %>%
+    filter(Mode == "Personal_LDV", Tech == "BEV_400") %>%
+    mutate(Tech = "BEV_300"),
+  HI_survival %>%
+    filter(Mode == "Personal_LDV", Tech == "BEV_400") %>%
+    mutate(Tech = "PHEV_50"),
+  HI_survival %>%
+    filter(Mode == "Personal_LDV", Tech == "BEV_400") %>%
+    mutate(Tech = "PHEV_25"),
+  HI_survival %>%
+    filter(Mode == "Personal_LDV", Tech == "ICEV_Gasoline") %>%
+    mutate(Tech = "HEV_Gasoline"),
+  HI_survival %>%
+    filter(Mode == "Personal_LDV", Tech == "ICEV_Gasoline") %>%
+    mutate(Tech = "ICEV_NG"),
+  HI_survival %>%
+    filter(Mode == "Personal_LDV", Tech == "ICEV_Gasoline") %>%
+    mutate(Tech = "FCEV")
+)
+
+HI_survival_new %>% select(Mode, Tech, Class, Age, Annual_Survival) %>%
+  mutate(Annual_Survival = if_else(Mode == "Bus" & Annual_Survival == 93, 0.93, Annual_Survival)) %>%
+  write_csv("C:/Users/ayip/Documents/GitHub/TMM-pjmm/TEMPO.jl/data/survival/vehicle-survival-ldv_bytech-jb-class-LDV_HI_20yrmax_cleaned.csv",
+            na = "")
+
+HI_survival_new %>%
+  filter(Mode == "Personal_LDV") %>%
+  ggplot() +
+  geom_line(aes(x=Age, y=Annual_Survival, col=Tech)) +
+  facet_grid(rows = vars(Tech), cols = vars(Class))
+
+```
+
+# review regular
+
+```{r}
+
+HI_survival <- read_csv("C:/Users/ayip/Documents/GitHub/TMM-pjmm/TEMPO.jl/data/survival/vehicle-survival-ldv_bytech-jb-class-LDV_HI.csv")
+
+HI_survival %>%
+  filter(Mode == "Personal_LDV") %>%
+  ggplot() +
+  geom_line(aes(x=Age, y=Annual_Survival, col=Tech)) +
+  facet_grid(rows = vars(Tech), cols = vars(Class))
+
+```

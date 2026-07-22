@@ -1,0 +1,17 @@
+# Normalize line endings: LF in the repo, checked out native on Windows
+* text=auto
+
+# Code & text always LF
+*.R    text eol=lf
+*.qmd  text eol=lf
+*.md   text eol=lf
+*.Rproj text eol=lf
+*.yml  text eol=lf
+
+# Binary assets — never touch
+*.xlsx binary
+*.docx binary
+*.pptx binary
+*.pdf  binary
+*.png  binary
+*.zip  binary
