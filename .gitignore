@@ -1,0 +1,101 @@
+# -----------------------------------------------
+# Data files — large or proprietary data files
+# should not be committed; place them in data/raw/
+# and list them in data/README.md instead.
+# -----------------------------------------------
+# Common tabular data formats
+*.csv
+*.xlsx
+*.xls
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+*.db
+*.sqlite
+
+# Compressed archives
+*.zip
+*.gz
+*.tar
+*.7z
+
+# Allow small example / sample data files (prefix with "sample_" or "example_")
+!data/raw/sample_*
+!data/raw/example_*
+!data/processed/sample_*
+!data/processed/example_*
+
+# -----------------------------------------------
+# Generated results — figures and tables are
+# outputs and should be regenerated from code.
+# -----------------------------------------------
+results/figures/*
+results/tables/*
+# Keep the directory structure in git
+!results/figures/.gitkeep
+!results/tables/.gitkeep
+
+# -----------------------------------------------
+# Python
+# -----------------------------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.Python
+*.whl
+.env
+.venv
+env/
+venv/
+ENV/
+
+# -----------------------------------------------
+# Jupyter Notebooks
+# -----------------------------------------------
+.ipynb_checkpoints/
+*.nbconvert.*
+
+# -----------------------------------------------
+# R
+# -----------------------------------------------
+.Rhistory
+.RData
+.Rproj.user/
+*.Rproj
+*.rds
+*.RDS
+# R package build artifacts
+*.tar.gz
+/doc/
+/Meta/
+
+# -----------------------------------------------
+# conda / pip
+# -----------------------------------------------
+*.egg-info/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# -----------------------------------------------
+# OS / editor artifacts
+# -----------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace

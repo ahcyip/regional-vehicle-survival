@@ -1,0 +1,30 @@
+name: regional-vehicle-survival
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  # Data manipulation
+  - pandas
+  - numpy
+  - polars
+  # Survival analysis
+  - pip:
+    - lifelines          # Kaplan-Meier, Cox PH, parametric survival models
+    - scikit-survival    # scikit-learn compatible survival analysis
+  # Statistical modeling
+  - scipy
+  - statsmodels
+  - scikit-learn
+  # Visualization
+  - matplotlib
+  - seaborn
+  - plotly
+  # Notebooks
+  - jupyter
+  - jupyterlab
+  - ipykernel
+  # Utilities
+  - pyyaml
+  - tqdm
+  - pip
