@@ -75,7 +75,6 @@ ENV/
 *.rds
 *.RDS
 # R package build artifacts
-*.tar.gz
 /doc/
 /Meta/
 
