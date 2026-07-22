@@ -1786,16 +1786,16 @@ make_sankey <- function(df, title_text) {
   # (top-15 lumping preserves sums)
   actual_balance <- sum(importers$flow) / sum(exporters$flow)
 
-  # labels carry the actual flows; only the drawn widths are balanced below
+  # link widths are drawn from the real, unscaled flows - the gap between
+  # gross exports and gross imports (reported in the caption below the
+  # title) is real, not estimation noise to be hidden, so it's left visible
+  # here rather than rescaling importers to force a false visual balance.
   exp_labels <- paste0(exporters$STNAME, " (", scales::comma(round(exporters$flow, -2)), ")")
   imp_labels <- paste0(importers$STNAME, " (", scales::comma(round(importers$flow, -2)), ")")
   # short label: the balance % is already stated in the caption below the
   # title, so the node label just needs to fit without touching the
   # importer column - a long label here collided with node text to its right
   pool_label <- "Net flow pool"
-
-  # force balance so the Sankey looks symmetric
-  importers <- importers |> mutate(flow = flow * (sum(exporters$flow) / sum(flow)))
 
   nodes <- tibble(
     name  = c(exp_labels, pool_label, imp_labels),
