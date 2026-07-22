@@ -1,0 +1,134 @@
+---
+title: "county_stock"
+format: html
+editor: visual
+---
+
+C:/Users/ayip/Documents/GitHub/TEMPO/TEMPO.jl/data/passenger-projected-ldv-new-fuel-economy-ATB2024_1101-mid.csv
+
+C:/Users/ayip/Documents/GitHub/TEMPO/TEMPO.jl/data/passenger-initial-ldv-fleet-fuel-economy-anl23-mid.csv
+
+national stock
+
+passenger-initial-ldv-stock-veh-vintage-moves-bev200.csv (default since decarb?)
+
+county stock
+
+|  |  |
+|--------------------------------------|----------------------------------|
+| passenger-initial-ALL-stock-veh_polk_2017_by_county_cleaned-aeovalid-bev200 | passenger-initial-ALL-stock-veh_polk_2017_by_county_cleaned-aeovalid |
+
+So my hypothesis is that in these 4 counties (and possibly in too many counties), SUVs dominate the new sales, including fixed EV sales, in the near term, because of a mismatch in projected trends in ownership/demand vs. existing stock. this would pull up the energy use by weighting towards SUV. Lack of BEV200/400 might also be playing a role.
+
+Whereas in national, it's likely more balanced/calibrated.
+
+```{r}
+library(tidyverse)
+natlstock<-read_csv("C:/Users/ayip/OneDrive - NREL (1)/from eagle/oe/natl-household-stock.csv")
+sjstock<-read_csv("C:/Users/ayip/OneDrive - NREL (1)/from eagle/oe/06085-household-stock.csv")
+wystock<-read_csv("C:/Users/ayip/OneDrive - NREL (1)/from eagle/oe/56005-household-stock.csv")
+oahunzstock<-read_csv("C:/Users/ayip/OneDrive - NREL (1)/from eagle/oe/oahu-nz-household-stock.csv")
+oahumidstock<-read_csv("C:/Users/ayip/OneDrive - NREL (1)/from eagle/oe/oahu-mid-household-stock.csv")
+tdmrunstock <- read_csv("c:/users/ayip/downloads/tdm-household-stock.csv")
+
+allstock<-bind_rows(natlstock %>% mutate(Region = "national"), 
+          sjstock %>% mutate(Region = as.character(Region)), 
+          wystock %>% mutate(Region = as.character(Region)), 
+          oahunzstock %>% mutate(Region = paste0(Region," NZ")), 
+          oahumidstock %>% mutate(Region = paste0(Region, " Mid")),
+          tdmrunstock %>% mutate(Region = paste0(Region, " tdm")))
+
+# allstock %>%
+# filter(Mode == "Personal_LDV",
+#        #str_detect(Tech, "BEV|PHEV"),
+#        Year < 2025 | Year %in% c(2025,2030,2040),
+#        Vintage >= 2000
+#        ) %T>%
+#   skimr::skim() %>%
+#   View()
+
+```
+
+```{r}
+allstock %>%
+  filter(Mode == "Personal_LDV",
+       #str_detect(Tech, "BEV|PHEV"),
+       Year < 2025 | Year %in% c(2025,2030,2040,2050),
+       Vintage >= 2000
+       ) %>%
+#group_by(Region, Year, Mode, Class, Tech)
+ggplot() +
+  geom_histogram(aes(x=Vintage,weight=Vehicles,fill=Class), binwidth=1) +
+  facet_grid(rows=vars(Region),cols=vars(Year), scales = "free_y") +
+  #xlim(c(2000,2041)) +
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(title = "All-powertrain personal_ldv stock by vintage and class over simulation years")
+ggsave("alltechstock_byvintageclass_oversimyears_forSJWYnatl.png", width = 10, height = 8)
+
+allstock %>%
+filter(Mode == "Personal_LDV",
+       str_detect(Tech, "BEV|PHEV"),
+       Year < 2025 | Year %in% c(2025,2030,2040,2050),
+       Vintage >= 2000
+       ) %>%
+#group_by(Region, Year, Mode, Class, Tech)
+ggplot() +
+  geom_histogram(aes(x=Vintage,weight=Vehicles,fill=Class), binwidth=1) +
+  facet_grid(rows=vars(Region),cols=vars(Year), scales = "free_y") +
+  #xlim(c(2000,2041)) +
+  theme(axis.text.x = element_text(angle = 90)) +
+  labs(title = "BEV and PHEV personal_ldv stock by vintage and class over simulation years")
+ggsave("EVstock_byvintageclass_oversimyears_forSJWYnatl.png", width = 10, height = 8)
+
+
+
+allstock %>%
+  mutate(new = case_when(Vintage > Year ~ "Vintage>Year", 
+                         Vintage == Year ~ "Vintage=Year",
+                         Vintage < Year ~ "Vintage<Year")) %>%
+filter(Mode == "Personal_LDV",
+       #str_detect(Tech, "BEV|PHEV"),
+       Year < 2025 | Year %in% c(2025,2030,2040)
+       ) %>%
+#group_by(Region, Year, Mode, Class, Tech)
+ggplot() +
+  geom_col(aes(x=new,y=Vehicles,fill=Class)) +
+  theme(axis.text.x = element_text(angle = 90)) +
+  facet_grid(rows=vars(Region),cols=vars(Year), scales = "free_y") +
+  labs(title = "All-powertrain personal_ldv stock by vintage bin and class over simulation years")
+ggsave("alltechstock_byvintagebinclass_oversimyears_forSJWYnatl.png", width = 10, height = 8)
+
+allstock %>%
+  mutate(new = case_when(Vintage > Year ~ "Vintage>Year", 
+                         Vintage == Year ~ "Vintage=Year",
+                         Vintage < Year ~ "Vintage<Year")) %>%
+filter(Mode == "Personal_LDV",
+       #str_detect(Tech, "BEV|PHEV"),
+       Year < 2025 | Year %in% c(2025,2030,2040,2050)
+       ) %>%
+#group_by(Region, Year, Mode, Class, Tech)
+ggplot() +
+  geom_bar(aes(x=new,weight=Vehicles,fill=Class), position = "fill") +
+  theme(axis.text.x = element_text(angle = 90)) +
+  facet_grid(rows=vars(Region),cols=vars(Year), scales = "free_y") +
+  labs(title = "Class proportions of all-powertrain personal_ldv stock by vintage bin, over simulation years", y="Proportion of vehicles")
+ggsave("alltechstock_byvintagebinclassproportion_oversimyears_forSJWYnatl.png", width = 10, height = 8)
+
+
+allstock %>%
+mutate(new = case_when(Vintage > Year ~ "Vintage>Year", 
+                         Vintage == Year ~ "Vintage=Year",
+                         Vintage < Year ~ "Vintage<Year")) %>%
+  filter(Mode == "Personal_LDV",
+       str_detect(Tech, "BEV|PHEV"),
+       Year < 2025 | Year %in% c(2025,2030,2040,2050)
+       ) %>%
+#group_by(Region, Year, Mode, Class, Tech)
+ggplot() +
+  geom_col(aes(x=new,y=Vehicles,fill=Class)) +
+  theme(axis.text.x = element_text(angle = 90)) +
+  facet_grid(rows=vars(Region),cols=vars(Year), scales = "free_y") +
+  labs(title = "BEV and PHEV personal_ldv stock by vintage bin and class over simulation years")
+ggsave("EVstock_byvintagebinclass_oversimyears_forSJWYnatl.png", width = 10, height = 8)
+
+```

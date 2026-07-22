@@ -1,0 +1,34 @@
+Package: regionalVehicleSurvival
+Title: Regional Vehicle Survival and Used-Vehicle Migration Analysis
+Version: 0.1.0
+Authors@R:
+    person("Arthur", "Yip", email = "arthur.yip@nrel.gov", role = c("aut", "cre"))
+Description: Analysis code for NREL's regional (state-level) vehicle survival
+    and used-vehicle migration (net imports/exports) work, using Experian
+    Vehicles-in-Operation data. The pipeline and analysis live in
+    survival.qmd. This DESCRIPTION lists package dependencies; use renv for
+    a fully pinned, reproducible environment (renv::init(); renv::snapshot()).
+Encoding: UTF-8
+Depends:
+    R (>= 4.2)
+Imports:
+    tidyverse,
+    readxl,
+    patchwork,
+    scales,
+    geofacet,
+    gganimate,
+    gifski,
+    plotly,
+    htmlwidgets,
+    htmltools,
+    networkD3,
+    leaflet,
+    mapview,
+    sf,
+    tigris,
+    RColorBrewer,
+    skimr,
+    here
+Suggests:
+    webshot2
