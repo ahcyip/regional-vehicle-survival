@@ -209,7 +209,7 @@ R replication of the NetImports tab chain of `StateNationalSurvivalRateDifferenc
 - `old` — weighted mean over ages 2–8, weights = cumulative product of *national* survival within the same yearpair (the workbook's original method, cols AP–AV). Computed for **every** yearpair. **This is the production method** (see note below).
 - `new` — hybrid (workbook's "NewMethod", generalized): where a yearpair has the 6 consecutive prior yearpairs needed (2020/21 onward), the weight for age *a* follows the cohort backward through the *state's own* survival: s(yp, a) × s(yp−1, a−1) × … × s(yp−(a−2), 2). Earlier yearpairs fall back to the old method. (The workbook applied cohort weights only to its latest yearpair, 2021/22.) **Kept only as a validation check, not used downstream** (see note below).
 
-**Decision: national weights, not state weights (2026-07 email from Greene).** Greene tested national vs. state survival as weights on the 2021/22 yearpair and found them statistically equivalent (R² 0.99, slopes 0.98–1.00, intercepts ~0.00002–0.0003), so he chose to keep the simpler national-weights method. Our own `new` method *is* the state-weights test he ran (cohort weights follow the state's own survival) — reproducing his check on our pipeline for 2021/22 gives R² 0.997–0.999, slopes 0.977–0.999, intercepts −0.0003 to 0.00005 (see the validation chunk below), confirming his result independently. **`old` (national weights, all yearpairs) is therefore the production method** used in the Sankeys and headline results; `new` stays in the code as a documented robustness check but no longer gets its own Sankeys/comparisons.
+**Decision: national weights, not state weights (2026-07 email from Greene).** Greene tested national vs. state survival as weights on the 2021/22 yearpair and found them statistically equivalent (R² 0.99, slopes 0.98–1.00, intercepts ~0.00002–0.0003), so he chose to keep the simpler national-weights method. Our own `new` method *is* the state-weights test he ran (cohort weights follow the state's own survival) — reproducing his check on our pipeline for 2021/22 gives R² 0.997–0.999, slopes 0.977–0.999, intercepts −0.0003 to 0.00005 (see the validation chunk below), confirming his result independently. **`old` (national weights, all yearpairs) is therefore the production method** used in the Sankeys and results; `new` stays in the code as a documented robustness check but no longer gets its own Sankeys/comparisons.
 
 Deliberate differences from the workbook (all verified against the Jul 2026 file in `known_differences_vs_excel_jul2026.csv`; identical results to Mar 2026, since the Jul file's analysis tabs are byte-identical to March — see the validation section below):
 
@@ -348,7 +348,7 @@ net_imports_long |> write_csv(file.path(surv_data_dir, "net_imports_long.csv"))
 year_sets <- list(
   yrs1519  = 2015:2019,                      # current qmd / Sankey default
   yrs1421  = 2014:2021,                      # workbook window
-  yrs_excl = setdiff(2014:2024, c(2020, 2022)),  # headline: excl. COVID-era
+  yrs_excl = setdiff(2014:2024, c(2020, 2022)),  # excludes COVID-era yearpairs
   yrs_all  = 2014:2024
 )
 
@@ -1949,7 +1949,7 @@ for (vc in c("Car", "SUV", "Pickup")) {
     filter(VehicleClass == .env$vc, method == "old")
 
   state_order <- df |>
-    filter(year_set == "yrs_excl") |>
+    filter(year_set == "yrs_all") |>
     arrange(Average) |>
     pull(statename)
 
@@ -1985,4 +1985,40 @@ national_sums
 
 national_sums |>
   write_csv(file.path(out_dir_cmp, "national_reconciliation_by_method.csv"))
+
+# --- D. per-yearpair reconciliation (every year, not just the 4 windows) --
+# rates and per-year VIO stock are both available for every yearpair, so
+# this doesn't need to wait for a window average - gross exports/imports
+# and their gap can be checked yearpair by yearpair.
+net_imports_long_stock <- net_imports_long |>
+  left_join(vehstock_by_year, by = join_by(year, statename, VehicleClass)) |>
+  mutate(value_stock = value * stock)
+
+yearly_gap <- net_imports_long_stock |>
+  filter(method == "old", !is.na(value_stock)) |>
+  summarise(gross_exports = sum(abs(pmin(value_stock, 0))),
+            gross_imports = sum(pmax(value_stock, 0)),
+            .by = c(VehicleClass, year)) |>
+  mutate(net = gross_imports - gross_exports,
+         imports_pct_of_exports = 100 * gross_imports / gross_exports) |>
+  arrange(VehicleClass, year)
+
+yearly_gap
+yearly_gap |> write_csv(file.path(out_dir_cmp, "export_import_gap_by_year.csv"))
+
+p_yearly_gap <- yearly_gap |>
+  ggplot(aes(x = year, y = imports_pct_of_exports, color = VehicleClass)) +
+  geom_hline(yintercept = 100, color = "#c3c2b7", linewidth = 0.4) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 1.8) +
+  scale_color_manual(values = c(Car = "#2a78d6", SUV = "#1baf7a", Pickup = "#eda100")) +
+  scale_x_continuous(breaks = 2014:2024) +
+  labs(title = "Net-import estimate reconciliation, by yearpair",
+       subtitle = "National weights; gross imports as % of gross exports across states (100% = perfectly balanced)",
+       x = "Yearpair (start year)", y = "Imports as % of exports") +
+  theme_cmp
+
+ggsave(file.path(out_dir_cmp, "export_import_gap_by_year.png"),
+       plot = p_yearly_gap, width = 10, height = 6)
+print(p_yearly_gap)
 ```
