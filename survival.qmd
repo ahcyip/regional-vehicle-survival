@@ -5,25 +5,12 @@ format: html
 editor: visual
 ---
 
-# PLANNED CHANGE — per-year VIO stock instead of back-scaling (NOT YET ENACTED)
-
-Do not enact until Arthur says we are ready. When enacting, follow this plan.
-
-**Idea:** convert net imp/exp *rates* to vehicle *counts* using each year's actual VIO stock: `NetImpExp<y>_stock = rate(y) × stock(y)`. This replaces the current single-base approach, where the 2025 snapshot (`vehstockdata_forweightinggreene`, ages 2–8) is back-scaled with the assumed-1%/yr-growth factors `1 - 0.01*(2024 - y)` (`stock_factor()` in `netimports-summaries`; hard-coded 0.91–0.95 in `netimports-greene-compat`; `stock * 0.93` in the reconciliation chunk). We already load actual VIO for every year 2014–2025 (`exp_<year>_stock_interim.csv` → `data_list` in Phase 1), so no growth assumption is needed.
-
-**Steps:**
-
-1.  Phase 1: generalize `vehstockdata_forweightinggreene` into `vehstock_by_year` — for each year 2014–2025, stock by `STNAME` × `VehType` with `age = year - vehicle_model_year`, filtered to ages 2–8 (matching the rate windows). Build from `data_list`; write `data/state_vehtype_stock_by_year.csv` alongside the slim CSVs so Phase 1b stays self-contained (no full Experian reload).
-2.  `netimports-summaries`: join `net_imports_long` to `vehstock_by_year` by `(year, statename, VehicleClass)` and compute `value_stock = value * stock` per yearpair. Use **year1** of the yearpair (survival is n(t+1)/n(t) relative to the year-t fleet). Window summaries then operate on `value_stock` directly: `Average_stock = mean(value_stock)`, `Lo_stock`/`Hi_stock` from ±2 SD of `value_stock`. Delete `stock_factor()` and `stock_f`. Keep output column names (`Average_stock`, `Lo_stock`, `Hi_stock`) so the Sankey, leaflet, and comparison sections work unchanged.
-3.  `netimports-greene-compat`: replace `NetImpExp<yy>_stock = NetImpExp<yy> * stock * 0.9x` with the per-year join (`rate(y) × stock(y)`); `NetImpExpMean1519_stock` / `NetImpExpMean1421_stock` become means of the per-year stock values rather than mean-rate × 2025 stock × mean-factor. Bonus: 2014 and 2020+ yearpairs can now get proper `_stock` values (previously only 15–19 were hard-coded).
-4.  Reconciliation chunk ("Reconciliation of Greene net import/export by state"): replace `national_stock = sum(stock * 0.93)` with per-year national totals from `vehstock_by_year` (matched to the same years as the rate window being reconciled).
-5.  Validate: write an old-vs-new comparison CSV of all `_stock` columns. Expect the biggest deltas where actual fleet growth deviated from the 1%/yr assumption (COVID-era years) and in fast/slow-growing states.
-
 # TODO
 
 - try to generalize the pattern for each state
   - e.g. by averaging over years. similar to plotting all years per state overlaid differentiating by color (done this).
 - done. chord diagram of state-to-state flows based on the merged data from Greene and me
+- done. Greene's July 2026 workbook (`StateNationalSurvivalRateDifferences8Jul20262014to2024.xlsx`) landed and was checked: formula-level diff vs Mar 2026 shows only `NatSurv Trim` differs, by an added but *unwired* second block staging national survival through 2024/25 — `ByVType`/`SND`/`NetImports` are byte-identical to March, so `netimports-validate` (now pointed at the Jul file) reproduces the exact same 3 known differences, nothing new. Next check needed once Greene actually extends the SND/NetImports formula chain to use the new years.
 
 # Request/ guidance from Greene/UTK
 
@@ -181,6 +168,26 @@ state_survival_list |> bind_rows(.id = "yearpair") |> ungroup() |>
   select(yearpair, state_name, Age1, VehicleClass, survival) |>
   write_csv(file.path(surv_data_dir, "state_14to25_survival.csv"))
 
+# per-year VIO stock by state x vehicle class, ages 2-8 (matches the net-
+# import rate windows) - built from the already-loaded data_list, so this
+# costs nothing extra here. Phase 1b reads this CSV rather than relying on
+# the in-memory object, so it stays self-contained (no full Experian
+# reload needed just to compute net-import counts).
+vehstock_by_year <- data_list |>
+  imap(function(df, yr) {
+    yr_num <- as.integer(yr)
+    df |>
+      mutate(age = yr_num - vehicle_model_year) |>
+      filter(!is.na(VehicleClass), age >= 2, age <= 8) |>
+      summarise(stock = sum(stock, na.rm = TRUE), .by = c(state_name, VehicleClass)) |>
+      mutate(year = yr_num)
+  }) |>
+  list_rbind() |>
+  rename(statename = state_name) |>
+  select(year, statename, VehicleClass, stock)
+
+vehstock_by_year |> write_csv(file.path(surv_data_dir, "state_vehtype_stock_by_year.csv"))
+
 message("Phase 1 complete — CSVs saved to ", surv_data_dir)
 ```
 
@@ -204,7 +211,7 @@ R replication of the NetImports tab chain of `StateNationalSurvivalRateDifferenc
 
 **Decision: national weights, not state weights (2026-07 email from Greene).** Greene tested national vs. state survival as weights on the 2021/22 yearpair and found them statistically equivalent (R² 0.99, slopes 0.98–1.00, intercepts ~0.00002–0.0003), so he chose to keep the simpler national-weights method. Our own `new` method *is* the state-weights test he ran (cohort weights follow the state's own survival) — reproducing his check on our pipeline for 2021/22 gives R² 0.997–0.999, slopes 0.977–0.999, intercepts −0.0003 to 0.00005 (see the validation chunk below), confirming his result independently. **`old` (national weights, all yearpairs) is therefore the production method** used in the Sankeys and headline results; `new` stays in the code as a documented robustness check but no longer gets its own Sankeys/comparisons.
 
-Deliberate differences from the workbook (all verified against the Mar 2026 file in `known_differences_vs_excel_mar2026.csv`):
+Deliberate differences from the workbook (all verified against the Jul 2026 file in `known_differences_vs_excel_jul2026.csv`; identical results to Mar 2026, since the Jul file's analysis tabs are byte-identical to March — see the validation section below):
 
 - Missing (−99) or implausible (\|survival\| ≥ 2) cells become `NA` instead of the 999 flag. A flagged cell in the target yearpair makes that state × yearpair value `NA` (it then drops out of year-window averages via `na.rm`); a flagged cell that only contaminates a cohort *weight* drops that age term and renormalizes. Currently this only affects DC Pickup 2016/17.
 - Alabama Pickup 2015/16 age-1: the Mar 2026 fix of the old hard-coded cell subtracts the age-2 national survival (`$S$50`) instead of age-1 (`S49`); R computes the intended value.
@@ -358,21 +365,16 @@ method_labels <- c(
   new    = "new method (cohort weights, hybrid pre-2020/21)"
 )
 
-# generalizes the 0.91-0.95 stock back-scaling factors (0.95 for 2019,
-# 0.91 for 2015, i.e. 1 - 0.01*(2024 - y)); stock base is the 2025 fleet
-stock_factor <- function(years) mean(1 - 0.01 * (2024 - years))
+# per-year VIO stock (ages 2-8), from Phase 1's state_vehtype_stock_by_year.csv:
+# converts net-import RATES into vehicle COUNTS using each yearpair's own
+# year-1 fleet (survival ~ n(t+1)/n(t), so the year-t stock is the base),
+# rather than one 2025 snapshot back-scaled by an assumed 1%/yr growth rate.
+vehstock_by_year <- read_csv(file.path(surv_data_dir, "state_vehtype_stock_by_year.csv"),
+                             show_col_types = FALSE)
 
-vehstockdata_forweightinggreene <-
-  read_csv("C:/Users/ayip/OneDrive - NREL (1)/from eagle/experian/exp_2025_stock_interim.csv",
-           show_col_types = FALSE) |>
-  mutate(VehType = case_when(yip_tempo_class == "SUV" ~ "SUV",
-                             yip_tempo_class == "Pickup" ~ "Pickup",
-                             yip_tempo_class %in% c("Compact", "Midsize") ~ "Car",
-                             TRUE ~ NA_character_),
-         age = 2025 - vehicle_model_year,
-         STNAME = state_name) |>
-  filter(age <= 8, age >= 2) |>
-  summarise(stock = sum(stock), .by = c(STNAME, VehType))
+net_imports_long_stock <- net_imports_long |>
+  left_join(vehstock_by_year, by = join_by(year, statename, VehicleClass)) |>
+  mutate(value_stock = value * stock)
 
 summarize_net_imports <- function(long_df, years, set_name) {
   long_df |>
@@ -380,26 +382,27 @@ summarize_net_imports <- function(long_df, years, set_name) {
            # workbook excludes Tennessee's outlier first yearpair from the
            # weighted Average/Std.Dev (AVERAGE(AQ:AW)); simple Mean keeps it
            !(method != "simple" & statename == "Tennessee" & year == 2014)) |>
-    summarise(Average = mean(value, na.rm = TRUE),
-              Std_Dev = sd_pop(value),
-              n_years = sum(!is.na(value)),
+    summarise(Average       = mean(value, na.rm = TRUE),
+              Std_Dev       = sd_pop(value),
+              Average_stock = mean(value_stock, na.rm = TRUE),
+              Std_Dev_stock = sd_pop(value_stock),
+              n_years       = sum(!is.na(value)),
               .by = c(method, VehicleClass, statename)) |>
     mutate(Lo = Average - 2 * Std_Dev,
            Hi = Average + 2 * Std_Dev,
+           Lo_stock = Average_stock - 2 * Std_Dev_stock,
+           Hi_stock = Average_stock + 2 * Std_Dev_stock,
            # Mar-2026 workbook's new col BC: state's average is >2 SD from 0
            significant = as.integer(abs(Average / Std_Dev) > 2),
-           year_set = set_name,
-           stock_f  = stock_factor(years))
+           year_set = set_name)
 }
 
 net_imports_summary <- imap(year_sets,
-                            \(yrs, nm) summarize_net_imports(net_imports_long, yrs, nm)) |>
+                            \(yrs, nm) summarize_net_imports(net_imports_long_stock, yrs, nm)) |>
   list_rbind() |>
-  left_join(vehstockdata_forweightinggreene,
-            by = join_by(VehicleClass == VehType, statename == STNAME)) |>
-  mutate(Average_stock = round(Average * stock * stock_f, -2),
-         Lo_stock      = round(Lo      * stock * stock_f, -2),
-         Hi_stock      = round(Hi      * stock * stock_f, -2))
+  mutate(Average_stock = round(Average_stock, -2),
+         Lo_stock      = round(Lo_stock, -2),
+         Hi_stock      = round(Hi_stock, -2))
 
 net_imports_summary |> write_csv(file.path(surv_data_dir, "net_imports_summary.csv"))
 ```
@@ -409,44 +412,53 @@ net_imports_summary |> write_csv(file.path(surv_data_dir, "net_imports_summary.c
 # the old xlsx-based block so the reconciliation / leaflet-map sections
 # keep working. NetImpExpMean1421 averages available years (na.rm);
 # NetImpExpMean1519 keeps the plain 5-year formula, so DC Pickup (NA 2016)
-# propagates NA there and drops out of the 1519 map/Sankey.
+# propagates NA there and drops out of the 1519 map/Sankey. *_stock columns
+# use each year's own VIO stock (vehstock_by_year), not a back-scaled 2025
+# snapshot.
 simple_clean <- simple_ni |>
-  mutate(year = as.integer(str_sub(as.character(yearpair), 1, 4)))
+  mutate(year = as.integer(str_sub(as.character(yearpair), 1, 4))) |>
+  left_join(vehstock_by_year, by = join_by(year, statename, VehicleClass)) |>
+  mutate(value_stock = value * stock)
+
+rate_wide <- simple_clean |>
+  filter(year %in% 2015:2019) |>
+  mutate(yr2 = paste0("NetImpExp", str_sub(as.character(year), 3, 4))) |>
+  select(VehType = VehicleClass, STNAME = statename, yr2, value) |>
+  pivot_wider(names_from = yr2, values_from = value)
+
+stock_wide <- simple_clean |>
+  filter(year %in% 2015:2019) |>
+  mutate(yr2 = paste0("NetImpExp", str_sub(as.character(year), 3, 4), "_stock")) |>
+  select(VehType = VehicleClass, STNAME = statename, yr2, value_stock) |>
+  pivot_wider(names_from = yr2, values_from = value_stock)
 
 greene_intermediate <- simple_clean |>
   filter(year %in% 2014:2021) |>
   group_by(VehType = VehicleClass, STNAME = statename) |>
-  summarise(NetImpExpMean1421 = mean(value, na.rm = TRUE), .groups = "drop") |>
-  left_join(
-    simple_clean |>
-      filter(year %in% 2015:2019) |>
-      mutate(yr2 = paste0("NetImpExp", str_sub(as.character(year), 3, 4))) |>
-      select(VehType = VehicleClass, STNAME = statename, yr2, value) |>
-      pivot_wider(names_from = yr2, values_from = value),
-    by = join_by(VehType, STNAME)
-  ) |>
-  left_join(vehstockdata_forweightinggreene, by = join_by(VehType, STNAME)) |>
+  summarise(NetImpExpMean1421       = mean(value, na.rm = TRUE),
+            NetImpExpMean1421_stock = round(mean(value_stock, na.rm = TRUE), -2),
+            .groups = "drop") |>
+  left_join(rate_wide, by = join_by(VehType, STNAME)) |>
+  left_join(stock_wide, by = join_by(VehType, STNAME)) |>
   mutate(NetImpExpMean1519 = (NetImpExp19 + NetImpExp18 + NetImpExp17 +
                               NetImpExp16 + NetImpExp15) / 5,
-         NetImpExpMean1519_stock = (NetImpExpMean1519 * stock * 0.92) |> round(-2),
-         NetImpExpMean1421_stock = (NetImpExpMean1421 * stock * 0.93) |> round(-2),
-         NetImpExp19_stock = NetImpExp19 * stock * 0.95,
-         NetImpExp18_stock = NetImpExp18 * stock * 0.94,
-         NetImpExp17_stock = NetImpExp17 * stock * 0.93,
-         NetImpExp16_stock = NetImpExp16 * stock * 0.92,
-         NetImpExp15_stock = NetImpExp15 * stock * 0.91)
+         NetImpExpMean1519_stock = round((NetImpExp19_stock + NetImpExp18_stock +
+                                          NetImpExp17_stock + NetImpExp16_stock +
+                                          NetImpExp15_stock) / 5, -2))
 
 greene_intermediate |> write_csv(file.path(surv_data_dir, "greene_intermediate.csv"))
 
 message("Phase 1b complete — net_imports CSVs saved to ", surv_data_dir)
 ```
 
-## Validation against the Mar 2026 workbook
+## Validation against the Jul 2026 workbook
 
 Compares R values against the workbook's cached values for its 8 yearpairs (2014–2021). Every difference is written out with the reason where known; anything with `reason == "UNEXPLAINED"` deserves investigation.
 
+The Jul 2026 file (`StateNationalSurvivalRateDifferences8Jul20262014to2024.xlsx`) is checked cell-for-cell against the Mar 2026 file first: only `NatSurv Trim` differs, and only by an added, unused second data block (cols F:I) that stages national survival through yearpair 2024/25. `ByVType`, `SND`, and `NetImports` — everything this validation actually reads — are byte-identical to March, so the "2014to2024" filename is aspirational: the analysis chain hasn't been rewired to consume the new years yet. This validation therefore checks the same 8 yearpairs as before and is expected to reproduce the March results exactly.
+
 ```{r netimports-validate}
-xlsx_path <- here::here("data/raw/StateNationalSurvivalRateDifferences19Mar2026NewMethod.xlsx")
+xlsx_path <- here::here("data/raw/StateNationalSurvivalRateDifferences8Jul20262014to2024.xlsx")
 
 ni_sheet <- readxl::read_excel(xlsx_path, sheet = "NetImports",
                                col_names = FALSE, .name_repair = "minimal")
@@ -485,11 +497,11 @@ validation <- excel_long |>
 
 validation |> count(reason)
 validation |>
-  write_csv(file.path(surv_data_dir, "known_differences_vs_excel_mar2026.csv"))
+  write_csv(file.path(surv_data_dir, "known_differences_vs_excel_jul2026.csv"))
 
 if (any(validation$reason == "UNEXPLAINED")) {
-  warning("Unexplained differences vs Mar 2026 workbook - inspect ",
-          "known_differences_vs_excel_mar2026.csv")
+  warning("Unexplained differences vs Jul 2026 workbook - inspect ",
+          "known_differences_vs_excel_jul2026.csv")
 }
 ```
 
@@ -534,6 +546,7 @@ state_surv_fleetsep <- read_csv(file.path(surv_data_dir, "pipeline_state_surviva
 greene_intermediate <- read_csv(file.path(surv_data_dir, "greene_intermediate.csv"))
 net_imports_long <- read_csv(file.path(surv_data_dir, "net_imports_long.csv"))
 net_imports_summary <- read_csv(file.path(surv_data_dir, "net_imports_summary.csv"))
+vehstock_by_year <- read_csv(file.path(surv_data_dir, "state_vehtype_stock_by_year.csv"))
 
 # year pair metadata
 year_pair_levels <- national_surv |> distinct(year_pair) |> pull(year_pair) |> sort()
@@ -1574,9 +1587,16 @@ HIcounty_aggregate_allyears_fleetsep %>%
 To see if they add up
 
 ```{r}
-# greene_intermediate already loaded from CSV in Phase 2
+# greene_intermediate, vehstock_by_year already loaded from CSV in Phase 2
 
 greene_intermediate |> head()
+
+# national stock for the 2015-2019 window, from each year's own VIO
+# (replaces the single 2025-snapshot * 0.93 back-scaling approximation)
+national_stock_1519 <- vehstock_by_year |>
+  filter(year %in% 2015:2019) |>
+  summarise(national_stock = sum(stock), .by = c(year, VehicleClass)) |>
+  summarise(national_stock = mean(national_stock), .by = VehicleClass)
 
 greene_intermediate |>
   group_by(VehType) %>%
@@ -1586,8 +1606,8 @@ greene_intermediate |>
             national_net_18 = sum(NetImpExp18_stock, na.rm=T),
             national_net_17 = sum(NetImpExp17_stock, na.rm=T),
             national_net_16 = sum(NetImpExp16_stock, na.rm=T),
-            national_net_15 = sum(NetImpExp15_stock, na.rm=T),
-            national_stock = sum(stock * 0.93, na.rm=T)) %>%
+            national_net_15 = sum(NetImpExp15_stock, na.rm=T)) %>%
+  left_join(national_stock_1519, by = join_by(VehType == VehicleClass)) |>
   mutate(pct_net = national_net_mean1519/national_stock)
 
 ```
