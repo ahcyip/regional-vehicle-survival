@@ -7,6 +7,17 @@
 | `StateNationalSurvivalRateDifferences19Mar2026NewMethod.xlsx` | Greene/UTK state-vs-national survival-rate & net-import workbook (19 Mar 2026 "NewMethod" version). Its `NetImports` tab is the reference the R pipeline replicates. | `survival.qmd`, Phase 1b (net imports) — current `xlsx_path` |
 | `StateNationalSurvivalRateDifferences8Jul20262014to2024.xlsx` | Newer Greene/UTK workbook (8 Jul 2026, 2014–2024). This is the anticipated "July 2026 version" flagged at the top of `survival.qmd`. **Not yet wired in** — integrating it (updating `xlsx_path`, re-running `netimports-validate`, diffing formulas vs the Mar 2026 file) is a pending task, so it's committed here but the code still points at the Mar 2026 file. | not yet (pending validation) |
 
+## `raw/` — auxiliary spreadsheets (committed, not read by the pipeline)
+
+These are reference/supporting spreadsheets kept for provenance. They are **not**
+read by `survival.qmd` (no code references them):
+
+| File | What it is |
+|------|-----------|
+| `FittedLogisticSurvival.xlsx` | Fitted logistic survival-curve parameters/values. |
+| `StateSurvivalCurvesCars.xlsx` | State-level survival curves for cars. |
+| `turnover and sales.xlsx` | Vehicle turnover and sales figures (2023). |
+
 ## External inputs — NOT in this repo
 
 These are large and/or restricted and live outside the repo:
