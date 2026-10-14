@@ -1756,6 +1756,7 @@ method_labels <- c(
 )
 
 # df: one row per state, columns STNAME + flow (net imports, vehicles/yr)
+# + rate (net imports as a share of the state's own stock, per yr)
 make_sankey <- function(df, title_text) {
   exporters <- df |>
     filter(flow < 0) |>
@@ -1771,14 +1772,16 @@ make_sankey <- function(df, title_text) {
     exporters <- bind_rows(
       slice_head(exporters, n = 15),
       tibble(STNAME = "Other exporters",
-             flow = sum(exporters$flow[16:nrow(exporters)]))
+             flow = sum(exporters$flow[16:nrow(exporters)]),
+             rate = NA_real_)
     )
   }
   if (nrow(importers) > 15) {
     importers <- bind_rows(
       slice_head(importers, n = 15),
       tibble(STNAME = "Other importers",
-             flow = sum(importers$flow[16:nrow(importers)]))
+             flow = sum(importers$flow[16:nrow(importers)]),
+             rate = NA_real_)
     )
   }
 
@@ -1790,8 +1793,15 @@ make_sankey <- function(df, title_text) {
   # gross exports and gross imports (reported in the caption below the
   # title) is real, not estimation noise to be hidden, so it's left visible
   # here rather than rescaling importers to force a false visual balance.
-  exp_labels <- paste0(exporters$STNAME, " (", scales::comma(round(exporters$flow, -2)), ")")
-  imp_labels <- paste0(importers$STNAME, " (", scales::comma(round(importers$flow, -2)), ")")
+  # "State (count; rate)" with the rate to the nearest whole percent; the
+  # lumped "Other" nodes pool states with different rates, so count only
+  node_labels <- function(d) {
+    rate_txt <- if_else(is.na(d$rate), "",
+                        paste0("; ", scales::percent(d$rate, accuracy = 1)))
+    paste0(d$STNAME, " (", scales::comma(round(d$flow, -2)), rate_txt, ")")
+  }
+  exp_labels <- node_labels(exporters)
+  imp_labels <- node_labels(importers)
   # short label: the balance % is already stated in the caption below the
   # title, so the node label just needs to fit without touching the
   # importer column - a long label here collided with node text to its right
@@ -1827,7 +1837,8 @@ make_sankey <- function(df, title_text) {
 
   balance_note <- paste0(
     "Gross imports = ", scales::percent(actual_balance, accuracy = 0.1),
-    " of gross exports across states.")
+    " of gross exports across states. ",
+    "Labels: vehicles/yr; % of the state's own age 2-8 stock per year.")
 
   htmlwidgets::prependContent(
     s,
@@ -1848,7 +1859,7 @@ save_sankey <- function(s, stem) {
 for (vc in c("Car", "SUV", "Pickup")) {
   df <- greene_intermediate |>
     filter(VehType == vc, !is.na(NetImpExpMean1519_stock)) |>
-    select(STNAME, flow = NetImpExpMean1519_stock)
+    select(STNAME, flow = NetImpExpMean1519_stock, rate = NetImpExpMean1519)
 
   s <- make_sankey(df, paste0(
     "Net Export and Import of ", vc,
@@ -1868,7 +1879,7 @@ for (m in c("old")) {
       df <- net_imports_summary |>
         filter(method == .env$m, year_set == .env$ys, VehicleClass == .env$vc,
                !is.na(Average_stock)) |>
-        select(STNAME = statename, flow = Average_stock)
+        select(STNAME = statename, flow = Average_stock, rate = Average)
 
       s <- make_sankey(df, paste0(
         "Net Export and Import of ", vc, "s per year (age 2-8 vehicles; ",
