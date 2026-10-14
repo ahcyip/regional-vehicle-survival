@@ -1826,12 +1826,14 @@ make_sankey <- function(df, title_text) {
 
   color_js <- 'd3.scaleOrdinal().domain(["exporter","pool","importer"]).range(["#7b2d8e","#aaaaaa","#e67e22"])'
 
+  # nodePadding 19 (was 13) keeps the 18px labels of the thinnest nodes
+  # (bottom of the exporter column) from overlapping each other
   s <- sankeyNetwork(
     Links = as.data.frame(links), Nodes = as.data.frame(nodes),
     Source = "source", Target = "target", Value = "value",
     NodeID = "name", NodeGroup = "group", colourScale = color_js,
     fontSize = 18, fontFamily = "sans-serif",
-    nodeWidth = 20, nodePadding = 13, sinksRight = TRUE,
+    nodeWidth = 20, nodePadding = 19, sinksRight = TRUE,
     width = 900, height = 900
   )
 
@@ -1840,10 +1842,13 @@ make_sankey <- function(df, title_text) {
     " of gross exports across states. ",
     "Labels: vehicles/yr; % of the state's own age 2-8 stock per year.")
 
+  # the widget page is wider than the 920px screenshot, so cap the text width
+  # or long titles get cut off at the right edge of the PNG
+  text_style <- "max-width:860px; text-align:center; font-family:sans-serif;"
   htmlwidgets::prependContent(
     s,
-    htmltools::tags$h3(title_text, style = "text-align:center; font-family:sans-serif;"),
-    htmltools::tags$p(balance_note, style = "text-align:center; font-family:sans-serif; color:#555555;")
+    htmltools::tags$h3(title_text, style = text_style),
+    htmltools::tags$p(balance_note, style = paste(text_style, "color:#555555;"))
   )
 }
 
