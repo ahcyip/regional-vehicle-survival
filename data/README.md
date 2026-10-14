@@ -7,6 +7,24 @@
 | `StateNationalSurvivalRateDifferences19Mar2026NewMethod.xlsx` | Greene/UTK state-vs-national survival-rate & net-import workbook (19 Mar 2026 "NewMethod" version). Its `NetImports` tab is the reference the R pipeline replicates. | `survival.qmd`, Phase 1b (net imports) — current `xlsx_path` |
 | `StateNationalSurvivalRateDifferences8Jul20262014to2024.xlsx` | Newer Greene/UTK workbook (8 Jul 2026, 2014–2024). This is the anticipated "July 2026 version" flagged at the top of `survival.qmd`. **Not yet wired in** — integrating it (updating `xlsx_path`, re-running `netimports-validate`, diffing formulas vs the Mar 2026 file) is a pending task, so it's committed here but the code still points at the Mar 2026 file. | not yet (pending validation) |
 
+## `raw/census_state_to_state/` — Census state-to-state migration flows (committed)
+
+U.S. Census Bureau, ACS 1-year **State-to-State Migration Flows** tables, downloaded
+unmodified on 14 Oct 2026 from
+<https://www.census.gov/data/tables/time-series/demo/geographic-mobility/state-to-state-migration.html>.
+Read by `population_migration.qmd`.
+
+| File | ACS year | Notes |
+|------|----------|-------|
+| `State_to_State_Migrations_Table_2014.xls` … `_2019.xls` | 2014–2019 | wide matrix, two header blocks |
+| `State_to_State_Migrations_Table_2021.xls` | 2021 | same layout |
+| `State_to_State_Migration_Table_2022_T13_updated_2024_06_27.xlsx` | 2022 | Census re-release correcting a Connecticut processing error |
+| `State_to_State_Migration_Table_2023_T13.xlsx` | 2023 | wide matrix, single header block |
+| `State_to_State_Migration_Table_2024_T13.xlsx` | 2024 | long format + supplemental total sheets; 285 small cells suppressed ("N") |
+
+No ACS 2020 table exists (standard 2020 1-year estimates were not released), and ACS
+2025 was not yet published at download time.
+
 ## `raw/` — auxiliary spreadsheets (committed, not read by the pipeline)
 
 These are reference/supporting spreadsheets kept for provenance. They are **not**
