@@ -10,6 +10,7 @@
 
 # Binary assets — never touch
 *.xlsx binary
+*.xls  binary
 *.docx binary
 *.pptx binary
 *.pdf  binary

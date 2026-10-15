@@ -13,6 +13,8 @@ net-import rates (a replication + extension of Greene/UTK's method), and the fig
 
 ```
 survival.qmd                      * main pipeline + analysis (canonical)
+population_migration.qmd          Census state-to-state migration; population-adjusted
+                                  vehicle net flows (reads survival.qmd's data/*.csv)
 investigate_vintaged_stock.qmd    side analysis: per-year vintaged stock
 R/
   eia_2023_surv.R                 standalone: AEO 2023 survival-curve comparison
