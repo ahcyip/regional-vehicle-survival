@@ -17,7 +17,7 @@ Standalone follow-up to Phase 1b of `survival.qmd`. Two questions:
 1. Is each state's average net import/export rate actually stable from yearpair to yearpair, or is the average hiding sign switches, trends, or one-off spikes?
 2. What do the Sankeys look like when built from each yearpair's own rate × that year's own stock, instead of from multi-year averages? And can gross imports and gross exports be matched more closely without rescaling anything?
 
-Everything uses the production method, `old` (national-survival weights). Rates are net imports as a share of the state's own age 2-8 stock per year (negative = net export); counts are rate × that year's age 2-8 VIO stock, as in `net_imports_long_stock` in `survival.qmd`.
+Rates throughout use the production method, `old` (national-survival weights): net imports as a share of the state's own age 2-8 stock per year (negative = net export). In sections 1–3, counts are rate × that year's age 2-8 VIO stock (`value_stock` in `survival.qmd`). Section 4 adds age-mix accounting counts. Since 2026-10-14, `survival.qmd`'s production Sankeys use those counts, with the national-survival-weighted rate for their % labels.
 
 **Inputs** (git-ignored, written by `survival.qmd`; copy them into `data/`):
 
@@ -624,9 +624,11 @@ spike_note <- function(vc, y) {
 
 ```{r sankey-per-year}
 #| results: hide
+# basis names how the counts and % were made (the age-mix Sankeys don't
+# use national-survival weights for their counts, so it isn't a fixed label)
 sankey_title <- function(vc, when, basis) {
   paste0("Net Export and Import of ", vc, "s per year, ", when,
-         " (age 2-8 vehicles; ", method_label, "; ", basis, "). ",
+         " (age 2-8 vehicles; ", basis, "). ",
          "Includes vehicle movements associated with both population migration and vehicle markets.")
 }
 
@@ -638,7 +640,7 @@ if (render_sankeys) {
         select(STNAME = statename, flow = count, rate)
       s <- make_sankey(df,
                        sankey_title(vc, paste("yearpair", yp_label(y)),
-                                    "that yearpair's rate × that year's stock"),
+                                    paste0(method_label, "; that yearpair's rate × that year's stock")),
                        extra_note = spike_note(vc, y))
       save_sankey(s, sankey_stem(vc, yp_label(y)))
     }
@@ -647,7 +649,7 @@ if (render_sankeys) {
         filter(year_set == ys, VehicleClass == vc, !is.na(Average_stock)) |>
         select(STNAME = statename, flow = Average_stock, rate = Average)
       s <- make_sankey(df, sankey_title(vc, paste("averaged over", year_set_labels[ys]),
-                                        "mean of the per-yearpair counts"))
+                                        paste0(method_label, "; mean of the per-yearpair counts")))
       save_sankey(s, sankey_stem(vc, paste0("avg_", ys)))
     }
   }
@@ -884,7 +886,9 @@ National survival at each age is the pooled ratio over the 51 states (checked be
 
 count~s~ = Σ~a~ n~s,a~ d~s,a~ = Σ~a~ [observed survivors~s,a~ − national survival~a~ × n~s,a~]
 
-This is the number of age 2-8 vehicles the state has in year *t*+1 beyond what national survival would leave it, which is the literal survival-residual definition of net migration. Its rate (count ÷ stock) is the state's survival differences weighted by its *own* observed age mix instead of the synthetic national one. Gross imports equal gross exports by construction in every yearpair; nothing is rescaled. The production method is unchanged; this section only shows the alternative next to it.
+This is the number of age 2-8 vehicles the state has in year *t*+1 beyond what national survival would leave it, which is the literal survival-residual definition of net migration. Its rate (count ÷ stock) is the state's survival differences weighted by its *own* observed age mix instead of the synthetic national one. Gross imports equal gross exports by construction in every yearpair; nothing is rescaled.
+
+Since 2026-10-14, `survival.qmd`'s production Sankeys use these counts for their vehicle numbers and ribbon widths (`Average_agemix`). The % labels, maps and the stability analysis above keep the national-survival-weighted rate, which is age-standardized and so comparable across states regardless of fleet age. The age-mix Sankeys below are drawn the same way, so their % labels match the production ones.
 
 ```{r agemix-accounting}
 age_counts <- read_csv(file.path(data_dir, "pipeline_state_survival_14to25.csv"),
@@ -1073,25 +1077,28 @@ p_scatter
 
 ```{r agemix-sankeys}
 #| results: hide
-# age-mix Sankeys: every yearpair, plus window averages built the same way
-# as production's (mean of per-yearpair counts and rates; TN 2014/15 dropped)
+# age-mix Sankeys, drawn like survival.qmd's production Sankeys: age-mix
+# counts for the ribbons and numbers, the national-survival-weighted rate
+# for the % labels. Every yearpair, plus window averages built the same way
+# as production's (mean of per-yearpair values; TN 2014/15 dropped)
 agemix_win <- imap(year_sets[c("yrs_all", "yrs_excl")], \(yrs, nm) {
   agemix |>
     filter(year %in% yrs, !tn_outlier) |>
-    summarise(flow = mean(count_agemix), rate = mean(rate_agemix),
+    summarise(flow = mean(count_agemix), rate = mean(rate, na.rm = TRUE),
               .by = c(VehicleClass, statename)) |>
     mutate(year_set = nm)
 }) |>
   list_rbind()
 
-agemix_basis <- "age-mix accounting: survivors vs national survival, age by age"
+agemix_basis <- paste0("counts: survivors vs national survival, age by age; ",
+                       "%: ", method_label)
 
 if (render_sankeys) {
   for (vc in classes) {
     for (y in 2014:2024) {
       df <- agemix |>
         filter(VehicleClass == vc, year == y) |>
-        select(STNAME = statename, flow = count_agemix, rate = rate_agemix)
+        select(STNAME = statename, flow = count_agemix, rate)
       s <- make_sankey(df,
                        sankey_title(vc, paste("yearpair", yp_label(y)), agemix_basis),
                        extra_note = spike_note(vc, y))
@@ -1173,4 +1180,4 @@ The averages that are *not* stable fall into three groups:
 
 **Per-yearpair Sankeys vs averages.** The top of each Sankey is steady: the median yearpair shares `r median(ov15$exporters)` of 15 top exporters and `r median(ov15$importers)` of 15 top importers with the `yrs_excl` averaged Sankey (top 5: `r median(ov5$exporters)` and `r median(ov5$importers)` of 5), and `r median(ov15_p$exporters)` / `r median(ov15_p$importers)` of 15 with the previous yearpair. The lower ranks churn, and two things reshuffle the top. First, spike yearpairs: in 2022/23 Virginia, Missouri and Maryland become the three largest Car and SUV importers. Second, large-stock states near zero: Texas Car is a top-3 exporter in 2015/16 and 2016/17 and the #1 importer in four other yearpairs, yet only a minor importer in the averages. Gross movement is larger in any single yearpair than in the averaged Sankeys: the `yrs_all` averaged Car Sankey shows `r pct(gross_ratio$ratio[gross_ratio$VehicleClass == "Car"])` of the mean per-yearpair gross exports (SUV `r pct(gross_ratio$ratio[gross_ratio$VehicleClass == "SUV"])`, Pickup `r pct(gross_ratio$ratio[gross_ratio$VehicleClass == "Pickup"])`), because averaging counts cancels sign switches.
 
-**Balance.** Per yearpair, gross imports run `r pct(bal_rng$lo[bal_rng$VehicleClass == "Car"])`–`r pct(bal_rng$hi[bal_rng$VehicleClass == "Car"])` of gross exports for Car, `r pct(bal_rng$lo[bal_rng$VehicleClass == "SUV"])`–`r pct(bal_rng$hi[bal_rng$VehicleClass == "SUV"])` for SUV and `r pct(bal_rng$lo[bal_rng$VehicleClass == "Pickup"])`–`r pct(bal_rng$hi[bal_rng$VehicleClass == "Pickup"])` for Pickup (the `yrs_excl` averaged Sankeys: Car `r pct(win_bal$imports_pct_of_exports[win_bal$VehicleClass == "Car"], 0.1)`, SUV `r pct(win_bal$imports_pct_of_exports[win_bal$VehicleClass == "SUV"], 0.1)`, Pickup `r pct(win_bal$imports_pct_of_exports[win_bal$VehicleClass == "Pickup"], 0.1)`). Using per-yearpair data does not close the gap; Car is worst in 2023/24 and 2024/25. The gap is not estimation noise: it is exactly the error from applying one synthetic national age mix to every state's actual fleet, mostly the difference between state and national age mixes, plus (for Car since 2020/21) the national car fleet ageing away from the synthetic weights. Counting survivors age by age against national survival (age-mix accounting) balances every yearpair to exactly 100% without any rescaling, while changing state rates very little (R² ≥ `r round(min(agemix_fit$r2), 3)`; mean absolute change `r round(100 * min(agemix_fit$mean_abs_diff), 2)`–`r round(100 * max(agemix_fit$mean_abs_diff), 2)` pp). It is shown here as an alternative alongside production, not swapped in.
+**Balance.** Per yearpair, gross imports run `r pct(bal_rng$lo[bal_rng$VehicleClass == "Car"])`–`r pct(bal_rng$hi[bal_rng$VehicleClass == "Car"])` of gross exports for Car, `r pct(bal_rng$lo[bal_rng$VehicleClass == "SUV"])`–`r pct(bal_rng$hi[bal_rng$VehicleClass == "SUV"])` for SUV and `r pct(bal_rng$lo[bal_rng$VehicleClass == "Pickup"])`–`r pct(bal_rng$hi[bal_rng$VehicleClass == "Pickup"])` for Pickup (the `yrs_excl` averaged Sankeys: Car `r pct(win_bal$imports_pct_of_exports[win_bal$VehicleClass == "Car"], 0.1)`, SUV `r pct(win_bal$imports_pct_of_exports[win_bal$VehicleClass == "SUV"], 0.1)`, Pickup `r pct(win_bal$imports_pct_of_exports[win_bal$VehicleClass == "Pickup"], 0.1)`). Using per-yearpair data does not close the gap; Car is worst in 2023/24 and 2024/25. The gap is not estimation noise: it is exactly the error from applying one synthetic national age mix to every state's actual fleet, mostly the difference between state and national age mixes, plus (for Car since 2020/21) the national car fleet ageing away from the synthetic weights. Counting survivors age by age against national survival (age-mix accounting) balances every yearpair to exactly 100% without any rescaling, while changing state rates very little (R² ≥ `r round(min(agemix_fit$r2), 3)`; mean absolute change `r round(100 * min(agemix_fit$mean_abs_diff), 2)`–`r round(100 * max(agemix_fit$mean_abs_diff), 2)` pp). Since 2026-10-14 the production Sankeys in `survival.qmd` use these age-mix counts for vehicle numbers and ribbon widths, keeping the national-survival-weighted rate for their % labels.

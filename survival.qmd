@@ -372,8 +372,41 @@ method_labels <- c(
 vehstock_by_year <- read_csv(file.path(surv_data_dir, "state_vehtype_stock_by_year.csv"),
                              show_col_types = FALSE)
 
+# age-mix accounting counts - the vehicle counts the production Sankeys use.
+# Each state's age 2-8 survivors in year t+1 minus what national survival
+# would leave from its own year-t stock, age by age:
+#   count = sum_a (n_t1[s,a] - S_nat[a] * n_t[s,a]) = sum_a n_t[s,a] * d[s,a]
+# National survival is the pooled ratio of the 51 states, so these counts sum
+# to exactly zero nationally in every yearpair: gross imports equal gross
+# exports with nothing rescaled. value_stock (rate x stock) instead weights
+# every state's d[s,a] by one synthetic national age mix, which leaves a
+# 104-132% import/export gap. The national-survival-weighted rate (value)
+# stays the age-standardized rate for comparing states (labels, maps).
+age_counts <- read_csv(file.path(surv_data_dir, "pipeline_state_survival_14to25.csv"),
+                       show_col_types = FALSE) |>
+  filter(Age1 >= 2, Age1 <= n_ages + 1) |>
+  transmute(year = as.integer(str_sub(as.character(year_pair), 1, 4)),
+            statename = state_name, VehicleClass, Age1, n_t = CY1, n_t1 = CY2)
+
+nat_age_surv <- read_csv(file.path(surv_data_dir, "pipeline_national_survival_14to25.csv"),
+                         show_col_types = FALSE) |>
+  filter(Age1 >= 2, Age1 <= n_ages + 1) |>
+  transmute(year = as.integer(str_sub(as.character(year_pair), 1, 4)),
+            VehicleClass, Age1, S_nat = CY2 / CY1)
+
+agemix_counts <- age_counts |>
+  left_join(nat_age_surv, by = join_by(year, VehicleClass, Age1)) |>
+  summarise(count_agemix = sum(n_t1 - S_nat * n_t),
+            .by = c(VehicleClass, statename, year))
+
+agemix_net <- agemix_counts |> summarise(net = sum(count_agemix), .by = c(VehicleClass, year))
+stopifnot(max(abs(agemix_net$net)) < 1e-3)
+
+agemix_counts |> write_csv(file.path(surv_data_dir, "net_imports_agemix_counts.csv"))
+
 net_imports_long_stock <- net_imports_long |>
   left_join(vehstock_by_year, by = join_by(year, statename, VehicleClass)) |>
+  left_join(agemix_counts, by = join_by(VehicleClass, statename, year)) |>
   mutate(value_stock = value * stock)
 
 summarize_net_imports <- function(long_df, years, set_name) {
@@ -386,6 +419,9 @@ summarize_net_imports <- function(long_df, years, set_name) {
               Std_Dev       = sd_pop(value),
               Average_stock = mean(value_stock, na.rm = TRUE),
               Std_Dev_stock = sd_pop(value_stock),
+              # TN 2014/15 is dropped above for the counts too, so windows
+              # containing it don't balance exactly
+              Average_agemix = mean(count_agemix, na.rm = TRUE),
               n_years       = sum(!is.na(value)),
               .by = c(method, VehicleClass, statename)) |>
     mutate(Lo = Average - 2 * Std_Dev,
@@ -400,9 +436,12 @@ summarize_net_imports <- function(long_df, years, set_name) {
 net_imports_summary <- imap(year_sets,
                             \(yrs, nm) summarize_net_imports(net_imports_long_stock, yrs, nm)) |>
   list_rbind() |>
-  mutate(Average_stock = round(Average_stock, -2),
-         Lo_stock      = round(Lo_stock, -2),
-         Hi_stock      = round(Hi_stock, -2))
+  # age-mix counts round to whole vehicles, not hundreds, so the windows that
+  # balance exactly still show 100.0% after summing ~51 rounded states
+  mutate(Average_stock  = round(Average_stock, -2),
+         Average_agemix = round(Average_agemix),
+         Lo_stock       = round(Lo_stock, -2),
+         Hi_stock       = round(Hi_stock, -2))
 
 net_imports_summary |> write_csv(file.path(surv_data_dir, "net_imports_summary.csv"))
 ```
@@ -1735,7 +1774,12 @@ htmlwidgets::saveWidget(m, file = paste0("est net flows/",VehTypeCurrent,".html"
 
 # Sankey diagrams of net state import/export flows
 
-One Sankey per vehicle class × averaging window, using the `old` (national-weights) method — the production method per Greene's validation, see Phase 1b — from `net_imports_summary` (Phase 1b / Phase 2), plus the legacy simple-method 2015–2019 versions under their original filenames.
+One Sankey per vehicle class × averaging window from `net_imports_summary` (Phase 1b / Phase 2), plus the legacy simple-method 2015–2019 versions under their original filenames. The production Sankeys combine two measures (decided 2026-10-14):
+
+- **Vehicle counts and ribbon widths: age-mix accounting** (`Average_agemix`). Each state's age 2-8 survivors minus what national survival would leave from its own stock, age by age. These balance exactly nationally in every yearpair, so gross imports equal gross exports without any rescaling.
+- **% labels: the `old` (national-survival weights) rate** (`Average`). This is the production method per Greene's validation (see Phase 1b): an age-standardized rate, comparable across states regardless of fleet age.
+
+Tennessee's outlier 2014/15 is left out of its averages for counts and rates alike, so windows containing 2014/15 fall short of exact balance by that amount. The legacy Sankeys keep the simple-method rate × stock counts.
 
 ```{r sankey-net-flows}
 library(networkD3)
@@ -1756,8 +1800,11 @@ method_labels <- c(
 )
 
 # df: one row per state, columns STNAME + flow (net imports, vehicles/yr)
-# + rate (net imports as a share of the state's own stock, per yr)
-make_sankey <- function(df, title_text) {
+# + rate (net imports as a share of the state's own stock, per yr).
+# label_note says what the counts and % are; extra_note adds a caption line.
+make_sankey <- function(df, title_text,
+                        label_note = "Labels: vehicles/yr; % of the state's own age 2-8 stock per year.",
+                        extra_note = NULL) {
   exporters <- df |>
     filter(flow < 0) |>
     mutate(flow = abs(flow)) |>
@@ -1839,8 +1886,7 @@ make_sankey <- function(df, title_text) {
 
   balance_note <- paste0(
     "Gross imports = ", scales::percent(actual_balance, accuracy = 0.1),
-    " of gross exports across states. ",
-    "Labels: vehicles/yr; % of the state's own age 2-8 stock per year.")
+    " of gross exports across states. ", label_note)
 
   # the widget page is wider than the 920px screenshot, so cap the text width
   # or long titles get cut off at the right edge of the PNG
@@ -1848,7 +1894,9 @@ make_sankey <- function(df, title_text) {
   htmlwidgets::prependContent(
     s,
     htmltools::tags$h3(title_text, style = text_style),
-    htmltools::tags$p(balance_note, style = paste(text_style, "color:#555555;"))
+    htmltools::tags$p(balance_note, style = paste(text_style, "color:#555555;")),
+    if (!is.null(extra_note))
+      htmltools::tags$p(extra_note, style = paste(text_style, "color:#555555; margin-top:-8px;"))
   )
 }
 
@@ -1874,22 +1922,34 @@ for (vc in c("Car", "SUV", "Pickup")) {
   message("Saved legacy Sankey for ", vc)
 }
 
-# production method (national weights) x all averaging windows
-# ("new"/cohort weights are computed in netimports-compute purely as a
-# validation check against this method - see netimports-compare - and no
-# longer get their own Sankeys)
+# production Sankeys x all averaging windows: age-mix accounting counts for
+# the ribbons and vehicle numbers, national-survival-weighted ("old") rates
+# for the % labels ("new"/cohort weights are computed in netimports-compute
+# purely as a validation check - see netimports-compare - and no longer get
+# their own Sankeys)
 for (m in c("old")) {
   for (ys in names(year_set_labels)) {
     for (vc in c("Car", "SUV", "Pickup")) {
-      df <- net_imports_summary |>
-        filter(method == .env$m, year_set == .env$ys, VehicleClass == .env$vc,
-               !is.na(Average_stock)) |>
-        select(STNAME = statename, flow = Average_stock, rate = Average)
+      win <- net_imports_summary |>
+        filter(method == .env$m, year_set == .env$ys, VehicleClass == .env$vc)
+      df <- win |>
+        filter(!is.na(Average_agemix)) |>
+        select(STNAME = statename, flow = Average_agemix, rate = Average)
 
-      s <- make_sankey(df, paste0(
-        "Net Export and Import of ", vc, "s per year (age 2-8 vehicles; ",
-        method_labels[m], "; averaged over ", year_set_labels[ys], "). ",
-        "Includes vehicle movements associated with both population migration and vehicle markets."))
+      # TN's outlier 2014/15 is dropped from its averages (counts included),
+      # which is the only thing keeping such windows from exact balance
+      tn_dropped <- with(win, n_years[statename == "Tennessee"] < max(n_years))
+
+      s <- make_sankey(
+        df,
+        paste0("Net Export and Import of ", vc, "s per year (age 2-8 vehicles; averaged over ",
+               year_set_labels[ys], "). ",
+               "Includes vehicle movements associated with both population migration and vehicle markets."),
+        label_note = paste0("Labels: vehicles/yr, each state's survivors counted age by age ",
+                            "against national survival; % = net import rate with ",
+                            "national-survival weights, of the state's own age 2-8 stock per year."),
+        extra_note = if (tn_dropped)
+          "Tennessee's outlier 2014/15 is left out of its average, which alone keeps imports below 100%.")
       save_sankey(s, paste0("sankey_net_flow_", str_to_lower(vc), "_", m, "_", ys))
       message("Saved Sankey: ", vc, " / ", m, " / ", ys)
     }
