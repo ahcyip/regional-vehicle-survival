@@ -1,0 +1,1183 @@
+---
+title: "Net used-vehicle imports by yearpair: stability and per-year Sankeys"
+author: "arthur yip"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    embed-resources: true
+    code-fold: true
+execute:
+  warning: false
+  message: false
+---
+
+Standalone follow-up to Phase 1b of `survival.qmd`. Two questions:
+
+1. Is each state's average net import/export rate actually stable from yearpair to yearpair, or is the average hiding sign switches, trends, or one-off spikes?
+2. What do the Sankeys look like when built from each yearpair's own rate × that year's own stock, instead of from multi-year averages? And can gross imports and gross exports be matched more closely without rescaling anything?
+
+Rates throughout use the production method, `old` (national-survival weights): net imports as a share of the state's own age 2-8 stock per year (negative = net export). In sections 1–3, counts are rate × that year's age 2-8 VIO stock (`value_stock` in `survival.qmd`). Section 4 adds age-mix accounting counts. Since 2026-10-14, `survival.qmd`'s production Sankeys use those counts, with the national-survival-weighted rate for their % labels.
+
+**Inputs** (git-ignored, written by `survival.qmd`; copy them into `data/`):
+
+- `net_imports_long.csv`, `state_vehtype_stock_by_year.csv`, `net_imports_summary.csv` (Phase 1b)
+- `pipeline_state_survival_14to25.csv`, `pipeline_national_survival_14to25.csv` (Phase 1; only for the age-mix accounting section)
+
+**Outputs:** `est net flows/by_year/` (git-ignored), Sankeys in its `sankey/` subfolder.
+
+```{r setup}
+library(tidyverse)
+library(geofacet)
+library(networkD3)
+
+data_dir   <- here::here("data")
+out_dir    <- here::here("est net flows", "by_year")
+sankey_dir <- file.path(out_dir, "sankey")
+dir.create(sankey_dir, recursive = TRUE, showWarnings = FALSE)
+
+# FALSE skips re-drawing the ~80 Sankey HTML/PNG files (one headless-Chrome
+# screenshot each) and reuses whatever PNGs are already on disk
+render_sankeys <- TRUE
+
+# saveWidget(selfcontained = TRUE) needs pandoc, which rmarkdown can't find
+# outside RStudio unless pointed at RStudio's bundled copy
+rstudio_pandoc <- "C:/Program Files/RStudio/resources/app/bin/quarto/bin/tools"
+if (!nzchar(Sys.getenv("RSTUDIO_PANDOC")) && dir.exists(rstudio_pandoc)) {
+  Sys.setenv(RSTUDIO_PANDOC = rstudio_pandoc)
+}
+
+# averaging windows, as in survival.qmd (start-year labels: 2014 = 2014/15)
+year_sets <- list(
+  yrs1519  = 2015:2019,
+  yrs1421  = 2014:2021,
+  yrs_excl = setdiff(2014:2024, c(2020, 2022)),
+  yrs_all  = 2014:2024
+)
+year_set_labels <- c(
+  yrs1519  = "2015/16–2019/20",
+  yrs1421  = "2014/15–2021/22",
+  yrs_excl = "2014/15–2024/25 excl. 20/21 & 22/23",
+  yrs_all  = "2014/15–2024/25 (all)"
+)
+excl_years <- c(2020, 2022)   # yearpairs 2020/21 and 2022/23, dropped by yrs_excl
+classes    <- c("Car", "SUV", "Pickup")
+
+yp_label <- function(y) paste0(y, "/", str_sub(y + 1, 3, 4))
+pct      <- function(x, acc = 1) scales::percent(x, accuracy = acc)
+
+# chart chrome
+col_ink   <- "#0b0b0b"
+col_ink2  <- "#52514e"
+col_muted <- "#898781"
+col_grid  <- "#e1e0d9"
+col_base  <- "#c3c2b7"
+col_band  <- "#ecebe4"
+col_exp   <- "#7b2d8e"   # exporter / importer colours match the Sankeys
+col_imp   <- "#e67e22"
+col_win   <- c(yrs_all = "#2a78d6", yrs_excl = "#eb6834")
+
+theme_nb <- theme_minimal(base_size = 10) +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = col_grid, linewidth = 0.3),
+        axis.text = element_text(color = col_ink2),
+        plot.title = element_text(size = 12, color = col_ink),
+        plot.subtitle = element_text(color = col_ink2),
+        plot.caption = element_text(color = col_ink2, hjust = 0),
+        strip.text = element_text(color = col_ink),
+        legend.position = "top",
+        plot.background = element_rect(fill = "#fcfcfb", color = NA))
+```
+
+```{r read-data}
+stock <- read_csv(file.path(data_dir, "state_vehtype_stock_by_year.csv"),
+                  show_col_types = FALSE)
+
+rates <- read_csv(file.path(data_dir, "net_imports_long.csv"),
+                  show_col_types = FALSE) |>
+  filter(method == "old") |>
+  left_join(stock, by = join_by(year, statename, VehicleClass)) |>
+  transmute(VehicleClass, statename,
+            year = as.integer(year), yearpair = yp_label(year),
+            rate = value, stock, count = value * stock, n_ages_used,
+            excluded_from_yrs_excl = year %in% excl_years,
+            # the workbook (and every window average) drops Tennessee's
+            # first yearpair from the weighted-method averages
+            tn_outlier = statename == "Tennessee" & year == 2014)
+
+stopifnot(nrow(rates) == 3 * 51 * 11, !anyNA(rates$stock))
+
+win_avg <- read_csv(file.path(data_dir, "net_imports_summary.csv"),
+                    show_col_types = FALSE) |>
+  filter(method == "old") |>
+  select(VehicleClass, statename, year_set, Average, Average_stock)
+
+# the window averages are plain means of these per-year rates (TN 2014/15
+# excluded), so the per-year view below is a decomposition of exactly the
+# numbers the averaged Sankeys use
+win_check <- imap(year_sets, \(yrs, nm) {
+  rates |>
+    filter(year %in% yrs, !tn_outlier) |>
+    summarise(avg = mean(rate, na.rm = TRUE), .by = c(VehicleClass, statename)) |>
+    mutate(year_set = nm)
+}) |>
+  list_rbind() |>
+  inner_join(win_avg, by = join_by(VehicleClass, statename, year_set))
+stopifnot(nrow(win_check) == 4 * 153, max(abs(win_check$avg - win_check$Average)) < 1e-12)
+
+rates |>
+  select(-n_ages_used) |>
+  arrange(VehicleClass, statename, year) |>
+  write_csv(file.path(out_dir, "netimports_rates_by_year_old.csv"))
+```
+
+# 1. Per-yearpair rates
+
+Tidy table: `est net flows/by_year/netimports_rates_by_year_old.csv` (one row per class × state × yearpair: rate, stock, count, flags).
+
+In the maps below each panel is one state. Reference lines are the all-years average (solid blue) and the `yrs_excl` average (dashed orange); shaded columns are 2020/21 and 2022/23, the two yearpairs `yrs_excl` drops. The y-axis is clipped at ±11% so the typical ±1–3% swings stay readable; anything beyond is drawn as a triangle at the edge with its real value printed beside it.
+
+```{r rate-geofacets}
+#| fig-width: 16
+#| fig-height: 11
+ylim_rate <- c(-0.11, 0.11)
+
+plot_geo_rates <- function(vc) {
+  d <- rates |>
+    filter(VehicleClass == vc) |>
+    mutate(off_scale = case_when(rate > ylim_rate[2] ~ "above",
+                                 rate < ylim_rate[1] ~ "below",
+                                 .default = "within"),
+           rate_plot = pmin(pmax(rate, ylim_rate[1]), ylim_rate[2]),
+           in_excl   = if_else(excluded_from_yrs_excl,
+                               "2020/21 or 2022/23 (dropped from yrs_excl)",
+                               "other yearpairs"))
+
+  refs <- win_avg |>
+    filter(VehicleClass == vc, year_set %in% c("yrs_all", "yrs_excl")) |>
+    mutate(window = factor(year_set, levels = c("yrs_all", "yrs_excl")))
+
+  off <- filter(d, off_scale != "within")
+
+  ggplot(d, aes(year, rate_plot)) +
+    annotate("rect", xmin = excl_years - 0.5, xmax = excl_years + 0.5,
+             ymin = -Inf, ymax = Inf, fill = col_band) +
+    geom_hline(yintercept = 0, color = col_base, linewidth = 0.3) +
+    geom_hline(aes(yintercept = Average, color = window, linetype = window),
+               data = refs, linewidth = 0.5) +
+    geom_line(color = col_ink2, linewidth = 0.4, na.rm = TRUE) +
+    geom_point(aes(fill = in_excl), data = filter(d, off_scale == "within"),
+               shape = 21, size = 1.3, stroke = 0.4, color = col_ink) +
+    geom_point(aes(shape = off_scale), data = off, size = 1.8, color = col_ink) +
+    # boxed so a label sitting over a neighbouring point/line stays legible
+    geom_label(aes(label = pct(rate),
+                   hjust = if_else(year >= 2022, 1.2, -0.2)),
+               data = off, size = 2.2, color = col_ink, fill = "#fcfcfb",
+               border.colour = NA, label.padding = unit(0.08, "lines")) +
+    facet_geo(~ statename, grid = "us_state_grid2") +
+    scale_color_manual(values = col_win, labels = year_set_labels[names(col_win)],
+                       name = "Average over") +
+    scale_linetype_manual(values = c(yrs_all = "solid", yrs_excl = "22"),
+                          labels = year_set_labels[names(col_win)],
+                          name = "Average over") +
+    scale_fill_manual(values = c("2020/21 or 2022/23 (dropped from yrs_excl)" = "white",
+                                 "other yearpairs" = col_ink),
+                      name = NULL) +
+    scale_shape_manual(values = c(above = 17, below = 25), guide = "none") +
+    scale_x_continuous(breaks = c(2014, 2019, 2024), labels = c("14/15", "19/20", "24/25")) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                       breaks = c(-0.05, 0, 0.05)) +
+    coord_cartesian(ylim = ylim_rate) +
+    labs(title = paste0(vc, "s: net import rate by yearpair, each state (national-survival weights)"),
+         subtitle = paste0("Share of the state's own age 2-8 stock per year; negative = net export. ",
+                           "Shaded: 2020/21 and 2022/23. Tennessee 2014/15 is the known outlier the averages exclude."),
+         x = "Yearpair", y = "Net import rate") +
+    theme_nb +
+    theme(strip.text = element_text(size = 7.5),
+          axis.text = element_text(size = 6.5),
+          panel.border = element_rect(color = col_grid, fill = NA, linewidth = 0.3))
+}
+
+for (vc in classes) {
+  p <- plot_geo_rates(vc)
+  ggsave(file.path(out_dir, paste0("rates_by_year_geofacet_", str_to_lower(vc), ".png")),
+         plot = p, width = 16, height = 11, dpi = 150)
+  print(p)
+}
+```
+
+# 2. Is each state's average stable?
+
+## Measures
+
+Per state × class, over all 11 yearpairs (10 for Tennessee, whose 2014/15 is excluded as in the window averages; 10 for DC Pickup, whose 2016/17 is `NA`):
+
+- **Spread:** SD and CV (SD / |mean|).
+- **Single-yearpair spikes:** a yearpair at least 3.5 robust SDs (MAD) *and* at least 3 percentage points from the state's median. A spike matters for the average if dropping the spikes moves the all-years average by ≥ 0.5 pp, which is enough to change a whole-percent Sankey label.
+- **Trend:** OLS slope of rate on year, fitted without spike yearpairs; p-values Benjamini–Hochberg adjusted within each class (153 tests would otherwise produce ~8 false positives at 5%). A trend counts if q < 0.05 and it moves the rate by ≥ 1 pp over the decade.
+- **Role (importer/exporter) consistency:** share of yearpairs whose sign matches the sign of the spike-free average, and the number of sign flips between consecutive yearpairs.
+- **Cross-state rank stability:** Spearman correlation across states between consecutive yearpairs, and between each yearpair and the average of all the other yearpairs.
+
+**Verdict** (first rule that applies): *Spike-driven average* → *Trending* → *Role flips* (sign matches in < 80% of yearpairs) → *Stable importer / Stable exporter*. All flags that apply are listed in `flags`.
+
+```{r stability-metrics}
+spike_z  <- 3.5    # robust z (MAD units) from the state's median...
+spike_pp <- 0.03   # ...and at least 3 pp away
+shift_pp <- 0.005  # spikes move the all-years average by >= 0.5 pp
+trend_pp <- 0.01   # trend moves the rate by >= 1 pp over 10 years
+sign_min <- 0.8    # role holds in >= 80% of yearpairs
+
+stab_input <- rates |>
+  filter(!tn_outlier, !is.na(rate)) |>
+  mutate(med   = median(rate),
+         z     = (rate - med) / mad(rate),
+         spike = abs(z) > spike_z & abs(rate - med) >= spike_pp,
+         .by = c(VehicleClass, statename))
+
+stability <- stab_input |>
+  arrange(VehicleClass, statename, year) |>
+  summarise(n_years       = n(),
+            avg_all       = mean(rate),
+            avg_excl      = mean(rate[!year %in% excl_years]),
+            median        = median(rate),
+            sd            = sd(rate),
+            cv            = sd / abs(avg_all),
+            n_spikes      = sum(spike),
+            spike_years   = str_flatten(str_c(yearpair[spike], " (", pct(rate[spike]), ")"), ", "),
+            avg_no_spikes = mean(rate[!spike]),
+            spike_shift   = avg_all - avg_no_spikes,
+            slope         = coef(lm(rate[!spike] ~ year[!spike]))[[2]],
+            p_trend       = summary(lm(rate[!spike] ~ year[!spike]))$coefficients[2, 4],
+            sign_share    = mean(sign(rate) == sign(avg_no_spikes)),
+            role_flips    = sum(diff(sign(rate)) != 0),
+            .by = c(VehicleClass, statename)) |>
+  mutate(q_trend = p.adjust(p_trend, method = "BH"), .by = VehicleClass) |>
+  mutate(role            = if_else(avg_no_spikes > 0, "importer", "exporter"),
+         flag_spike      = abs(spike_shift) >= shift_pp,
+         flag_trend      = q_trend < 0.05 & abs(slope * 10) >= trend_pp,
+         flag_role       = sign_share < sign_min,
+         flags = pmap_chr(list(flag_spike, flag_trend, flag_role), \(s, t, r) {
+           str_flatten(c("spike", "trend", "role flips")[c(s, t, r)], ", ")
+         }),
+         verdict = case_when(flag_spike ~ "Spike-driven average",
+                             flag_trend ~ "Trending",
+                             flag_role  ~ "Role flips",
+                             .default   = paste("Stable", role)),
+         verdict_group = if_else(str_starts(verdict, "Stable"), "Stable", verdict))
+
+# the all-years / yrs_excl columns reproduce net_imports_summary exactly
+avg_check <- stability |>
+  inner_join(win_avg |>
+               filter(year_set %in% c("yrs_all", "yrs_excl")) |>
+               select(-Average_stock) |>
+               pivot_wider(names_from = year_set, values_from = Average),
+             by = join_by(VehicleClass, statename))
+stopifnot(nrow(avg_check) == 153,
+          max(abs(avg_check$avg_all - avg_check$yrs_all)) < 1e-12,
+          max(abs(avg_check$avg_excl - avg_check$yrs_excl)) < 1e-12)
+
+stability |>
+  select(VehicleClass, statename, verdict, flags, role, n_years,
+         avg_all, avg_excl, avg_no_spikes, median, sd, cv,
+         n_spikes, spike_years, spike_shift,
+         slope_per_yr = slope, p_trend, q_trend, sign_share, role_flips) |>
+  arrange(VehicleClass, verdict, statename) |>
+  write_csv(file.path(out_dir, "netimports_stability_by_state_old.csv"))
+```
+
+```{r stability-summary-table}
+verdict_levels <- c("Stable importer", "Stable exporter", "Role flips",
+                    "Trending", "Spike-driven average")
+
+stability |>
+  count(VehicleClass, verdict) |>
+  mutate(verdict = factor(verdict, levels = verdict_levels),
+         VehicleClass = factor(VehicleClass, levels = classes)) |>
+  arrange(verdict) |>
+  pivot_wider(names_from = VehicleClass, values_from = n, values_fill = 0) |>
+  select(verdict, all_of(classes)) |>
+  knitr::kable(caption = "States per verdict (of 51), national-survival weights, all 11 yearpairs")
+```
+
+```{r unstable-table}
+stability |>
+  filter(!str_starts(verdict, "Stable")) |>
+  mutate(VehicleClass = factor(VehicleClass, levels = classes),
+         verdict = factor(verdict, levels = verdict_levels)) |>
+  arrange(verdict, VehicleClass, statename) |>
+  transmute(Verdict = verdict, Class = VehicleClass, State = statename,
+            `Avg all` = pct(avg_all, 0.1), `Avg excl` = pct(avg_excl, 0.1),
+            `Avg w/o spikes` = pct(avg_no_spikes, 0.1),
+            SD = pct(sd, 0.1),
+            `Trend (pp/10 yr)` = sprintf("%+.1f", slope * 1000),
+            `q trend` = signif(q_trend, 2),
+            `Sign share` = pct(sign_share),
+            Spikes = spike_years) |>
+  knitr::kable(caption = "States whose average is not stable, with the reason")
+```
+
+## Heatmap of every state × yearpair
+
+Rows are ordered by the all-years average; the two right-hand columns are the `yrs_all` and `yrs_excl` averages. Cells are clipped at ±6% for colour (spikes go well beyond); × marks a spike yearpair, and the dot after the state name gives its verdict.
+
+```{r heatmap}
+#| fig-width: 15
+#| fig-height: 12
+heat_lim <- 0.06
+
+heat_years <- rates |>
+  left_join(select(stab_input, VehicleClass, statename, year, spike),
+            by = join_by(VehicleClass, statename, year)) |>
+  transmute(VehicleClass, statename, column = yearpair, rate,
+            spike = coalesce(spike, FALSE), tn_outlier)
+
+heat_avgs <- win_avg |>
+  filter(year_set %in% c("yrs_all", "yrs_excl")) |>
+  transmute(VehicleClass, statename,
+            column = if_else(year_set == "yrs_all", "avg all", "avg excl"),
+            rate = Average, spike = FALSE, tn_outlier = FALSE)
+
+col_levels <- c(yp_label(2014:2024), "avg all", "avg excl")
+
+# one row per state within each class facet, ordered by the all-years average
+heat <- bind_rows(heat_years, heat_avgs) |>
+  left_join(select(stability, VehicleClass, statename, avg_all, verdict_group),
+            by = join_by(VehicleClass, statename)) |>
+  mutate(VehicleClass = factor(VehicleClass, levels = classes),
+         column = factor(column, levels = col_levels),
+         row = fct_reorder(paste0(statename, "___", VehicleClass), avg_all),
+         # marks on dark (clipped / near-clipped) cells need light ink
+         mark_col = if_else(abs(rate) > 0.035, "white", col_ink))
+
+verdict_cols <- c("Stable" = "#e1e0d9", "Role flips" = "#1baf7a",
+                  "Trending" = "#eb6834", "Spike-driven average" = "#2a78d6")
+
+p_heat <- ggplot(heat, aes(column, row)) +
+  geom_tile(aes(fill = pmin(pmax(rate, -heat_lim), heat_lim)),
+            color = "white", linewidth = 0.25) +
+  geom_text(aes(label = "×", color = I(mark_col)), data = filter(heat, spike), size = 2.6) +
+  geom_text(aes(label = "TN", color = I(mark_col)), data = filter(heat, tn_outlier), size = 2) +
+  geom_point(aes(x = 0.2, color = verdict_group),
+             data = distinct(heat, VehicleClass, row, verdict_group), size = 1.6) +
+  geom_vline(xintercept = 11.5, color = col_ink2, linewidth = 0.4) +
+  facet_wrap(vars(VehicleClass), scales = "free_y", nrow = 1) +
+  scale_y_discrete(labels = \(x) str_remove(x, "___.*$")) +
+  scale_x_discrete(labels = \(x) if_else(x %in% yp_label(excl_years), paste0(x, "*"), x)) +
+  scale_fill_gradient2(low = "#c8312f", mid = "#f0efec", high = "#1c5cab",
+                       midpoint = 0, limits = c(-heat_lim, heat_lim),
+                       labels = scales::percent_format(accuracy = 1),
+                       name = "Net import rate") +
+  scale_color_manual(values = verdict_cols, breaks = names(verdict_cols), name = "Verdict") +
+  coord_cartesian(xlim = c(0.2, 13.5), clip = "off") +
+  labs(title = "Net import rate by state and yearpair (national-survival weights)",
+       subtitle = "Blue = net importer, red = net exporter. * = dropped from yrs_excl. × = single-yearpair spike. Colour clipped at ±6%. Grey = NA (DC Pickup 2016/17).",
+       x = NULL, y = NULL) +
+  theme_nb +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 7),
+        axis.text.y = element_text(size = 6.5),
+        panel.grid.major = element_blank(),
+        legend.box = "horizontal")
+
+ggsave(file.path(out_dir, "rates_heatmap_all_classes.png"),
+       plot = p_heat, width = 15, height = 12, dpi = 150)
+p_heat
+```
+
+## Cross-state rank stability
+
+```{r rank-stability}
+#| fig-width: 10
+#| fig-height: 4.5
+xs <- rates |> filter(!tn_outlier, !is.na(rate))
+
+rank_cor <- map(2014:2024, \(y) {
+  this <- xs |> filter(year == y) |> select(VehicleClass, statename, rate)
+  prev <- xs |> filter(year == y - 1) |> select(VehicleClass, statename, prev = rate)
+  loo  <- xs |> filter(year != y) |>
+    summarise(loo = mean(rate), .by = c(VehicleClass, statename))
+  this |>
+    left_join(prev, by = join_by(VehicleClass, statename)) |>
+    left_join(loo, by = join_by(VehicleClass, statename)) |>
+    summarise(`vs previous yearpair` = if (all(is.na(prev))) NA_real_ else
+                cor(rate, prev, method = "spearman", use = "complete.obs"),
+              `vs average of the other yearpairs` = cor(rate, loo, method = "spearman"),
+              cross_state_sd = sd(rate),
+              .by = VehicleClass) |>
+    mutate(year = y)
+}) |>
+  list_rbind()
+
+rank_cor |>
+  mutate(yearpair = yp_label(year)) |>
+  write_csv(file.path(out_dir, "rank_correlation_by_yearpair.csv"))
+
+# share of the state-year variance that is persistent between-state
+# differences (vs year-to-year movement within a state)
+var_share <- bind_rows(
+  `all yearpairs`  = xs,
+  `spikes removed` = semi_join(xs, filter(stab_input, !spike),
+                               by = join_by(VehicleClass, statename, year)),
+  .id = "sample") |>
+  summarise(state_mean = mean(rate), within_var = var(rate),
+            .by = c(sample, VehicleClass, statename)) |>
+  summarise(between_share = var(state_mean) / (var(state_mean) + mean(within_var)),
+            .by = c(sample, VehicleClass))
+
+p_rank <- rank_cor |>
+  select(-cross_state_sd) |>
+  pivot_longer(starts_with("vs"), names_to = "comparison", values_to = "rho") |>
+  filter(!is.na(rho)) |>
+  mutate(VehicleClass = factor(VehicleClass, levels = classes)) |>
+  ggplot(aes(year, rho, color = comparison)) +
+  annotate("rect", xmin = excl_years - 0.5, xmax = excl_years + 0.5,
+           ymin = -Inf, ymax = Inf, fill = col_band) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 1.8) +
+  facet_wrap(vars(VehicleClass)) +
+  scale_color_manual(values = c(`vs previous yearpair` = "#2a78d6",
+                                `vs average of the other yearpairs` = "#eb6834"),
+                     name = NULL) +
+  scale_x_continuous(breaks = c(2014, 2017, 2020, 2023), labels = yp_label) +
+  scale_y_continuous(limits = c(0.4, 1)) +
+  labs(title = "How well does one yearpair's state ranking match the others?",
+       subtitle = "Spearman correlation across 51 states (TN 2014/15 excluded). Shaded: 2020/21 and 2022/23.",
+       x = "Yearpair", y = "Spearman rho") +
+  theme_nb
+
+ggsave(file.path(out_dir, "rank_correlation_by_yearpair.png"),
+       plot = p_rank, width = 10, height = 4.5, dpi = 150)
+p_rank
+
+var_share |>
+  pivot_wider(names_from = sample, values_from = between_share) |>
+  mutate(across(-VehicleClass, \(x) pct(x))) |>
+  knitr::kable(caption = "Share of state-yearpair variance that is persistent between-state difference")
+
+rank_cor |>
+  transmute(VehicleClass, yearpair = yp_label(year), sd = pct(cross_state_sd, 0.1)) |>
+  pivot_wider(names_from = VehicleClass, values_from = sd) |>
+  knitr::kable(caption = "Cross-state SD of the net import rate, by yearpair")
+```
+
+## Verdict map
+
+```{r verdict-map}
+#| fig-width: 15
+#| fig-height: 5
+grid <- geofacet::us_state_grid2
+
+p_vmap <- stability |>
+  left_join(grid, by = join_by(statename == name)) |>
+  mutate(VehicleClass = factor(VehicleClass, levels = classes),
+         label = paste0(code, "\n", sprintf("%+.1f", 100 * avg_all))) |>
+  ggplot(aes(col, -row)) +
+  geom_tile(aes(fill = verdict_group), color = "white", linewidth = 0.8) +
+  geom_text(aes(label = label), size = 2.3, lineheight = 0.85, color = col_ink) +
+  facet_wrap(vars(VehicleClass), nrow = 1) +
+  scale_fill_manual(values = verdict_cols, breaks = names(verdict_cols), name = NULL) +
+  coord_equal() +
+  labs(title = "Is the state's average net import rate stable? (national-survival weights, 11 yearpairs)",
+       subtitle = "Label: state and all-years average rate (%). Verdict rules in the text above.") +
+  theme_void(base_size = 10) +
+  theme(legend.position = "top",
+        plot.title = element_text(size = 12, color = col_ink),
+        plot.subtitle = element_text(color = col_ink2),
+        strip.text = element_text(color = col_ink, size = 11),
+        plot.margin = margin(10, 10, 10, 10),
+        plot.background = element_rect(fill = "#fcfcfb", color = NA))
+
+ggsave(file.path(out_dir, "stability_verdict_map.png"),
+       plot = p_vmap, width = 15, height = 5, dpi = 150)
+p_vmap
+```
+
+# 3. Per-yearpair Sankeys
+
+Same layout as `make_sankey` in `survival.qmd` (top 15 exporters and importers, the rest lumped; widths are the real, unscaled counts; the gross-imports-to-exports gap is stated in the caption). Changes: an optional extra caption line naming single-yearpair spikes so they are not mistaken for migration; wider node padding (19 vs 13) so the labels of the thinnest exporter nodes don't overlap; and the title/caption capped at 860px so long titles aren't cut off at the PNG's right edge.
+
+Files: `est net flows/by_year/sankey/sankey_net_flow_<class>_old_<yearpair>.png` (+ `.html`), plus the `yrs_all` and `yrs_excl` averages re-drawn alongside as `..._avg_<window>.png`.
+
+```{r sankey-helpers}
+method_label <- "national-survival weights"
+
+# df: one row per state, columns STNAME + flow (net imports, vehicles/yr)
+# + rate (net imports as a share of the state's own stock, per yr)
+make_sankey <- function(df, title_text, extra_note = NULL) {
+  exporters <- df |>
+    filter(flow < 0) |>
+    mutate(flow = abs(flow)) |>
+    arrange(desc(flow))
+
+  importers <- df |>
+    filter(flow > 0) |>
+    arrange(desc(flow))
+
+  # top 15 + other
+  if (nrow(exporters) > 15) {
+    exporters <- bind_rows(
+      slice_head(exporters, n = 15),
+      tibble(STNAME = "Other exporters",
+             flow = sum(exporters$flow[16:nrow(exporters)]),
+             rate = NA_real_)
+    )
+  }
+  if (nrow(importers) > 15) {
+    importers <- bind_rows(
+      slice_head(importers, n = 15),
+      tibble(STNAME = "Other importers",
+             flow = sum(importers$flow[16:nrow(importers)]),
+             rate = NA_real_)
+    )
+  }
+
+  # gross imports as a share of gross exports across states
+  # (top-15 lumping preserves sums)
+  actual_balance <- sum(importers$flow) / sum(exporters$flow)
+
+  # link widths are the real, unscaled flows; the gap between gross exports
+  # and gross imports is reported in the caption, never rescaled away.
+  # "State (count; rate)" with the rate to the nearest whole percent; the
+  # lumped "Other" nodes pool states with different rates, so count only
+  node_labels <- function(d) {
+    rate_txt <- if_else(is.na(d$rate), "",
+                        paste0("; ", scales::percent(d$rate, accuracy = 1)))
+    paste0(d$STNAME, " (", scales::comma(round(d$flow, -2)), rate_txt, ")")
+  }
+  exp_labels <- node_labels(exporters)
+  imp_labels <- node_labels(importers)
+  pool_label <- "Net flow pool"
+
+  nodes <- tibble(
+    name  = c(exp_labels, pool_label, imp_labels),
+    group = c(rep("exporter", nrow(exporters)), "pool", rep("importer", nrow(importers)))
+  ) |>
+    mutate(id = row_number() - 1L)
+
+  pool_id <- nodes |> filter(group == "pool") |> pull(id)
+
+  links <- bind_rows(
+    tibble(source = match(exp_labels, nodes$name) - 1L,
+           target = pool_id,
+           value  = exporters$flow),
+    tibble(source = pool_id,
+           target = match(imp_labels, nodes$name) - 1L,
+           value  = importers$flow)
+  )
+
+  color_js <- 'd3.scaleOrdinal().domain(["exporter","pool","importer"]).range(["#7b2d8e","#aaaaaa","#e67e22"])'
+
+  # nodePadding 19 (survival.qmd: 13) keeps the 18px labels of the thinnest
+  # nodes (bottom of the exporter column) from overlapping each other
+  s <- sankeyNetwork(
+    Links = as.data.frame(links), Nodes = as.data.frame(nodes),
+    Source = "source", Target = "target", Value = "value",
+    NodeID = "name", NodeGroup = "group", colourScale = color_js,
+    fontSize = 18, fontFamily = "sans-serif",
+    nodeWidth = 20, nodePadding = 19, sinksRight = TRUE,
+    width = 900, height = 900
+  )
+
+  balance_note <- paste0(
+    "Gross imports = ", scales::percent(actual_balance, accuracy = 0.1),
+    " of gross exports across states. ",
+    "Labels: vehicles/yr; % of the state's own age 2-8 stock per year.")
+
+  # the widget page is wider than the 920px screenshot, so cap the text width
+  # or long titles get cut off at the right edge of the PNG
+  text_style <- "max-width:860px; text-align:center; font-family:sans-serif;"
+  htmlwidgets::prependContent(
+    s,
+    htmltools::tags$h3(title_text, style = text_style),
+    htmltools::tags$p(balance_note, style = paste(text_style, "color:#555555;")),
+    if (!is.null(extra_note))
+      htmltools::tags$p(extra_note, style = paste(text_style, "color:#555555; margin-top:-8px;"))
+  )
+}
+
+save_sankey <- function(s, stem) {
+  html_file <- file.path(sankey_dir, paste0(stem, ".html"))
+  png_file  <- file.path(sankey_dir, paste0(stem, ".png"))
+  htmlwidgets::saveWidget(s, file = html_file, selfcontained = TRUE)
+  webshot2::webshot(html_file, file = png_file, vwidth = 920, vheight = 1040, delay = 1)
+  invisible(png_file)
+}
+
+sankey_stem <- function(vc, period, variant = "old") {
+  paste0("sankey_net_flow_", str_to_lower(vc), "_", variant, "_",
+         str_replace(period, "/", "-"))
+}
+
+# caption line naming that yearpair's spikes (and the TN outlier) for one class
+spike_note <- function(vc, y) {
+  sp <- stab_input |>
+    filter(VehicleClass == vc, year == y, spike) |>
+    arrange(desc(abs(rate)))
+  parts <- c(
+    if (y == 2014) "Tennessee 2014/15 is the known outlier the window averages exclude",
+    if (nrow(sp) > 0) paste0("Single-yearpair spikes (state's usual rate in brackets): ",
+                             str_flatten(paste0(sp$statename, " ", pct(sp$rate),
+                                                " (", pct(sp$med), ")"), ", "))
+  )
+  if (length(parts) == 0) NULL else paste0(str_flatten(parts, ". "), ".")
+}
+```
+
+```{r sankey-per-year}
+#| results: hide
+# basis names how the counts and % were made (the age-mix Sankeys don't
+# use national-survival weights for their counts, so it isn't a fixed label)
+sankey_title <- function(vc, when, basis) {
+  paste0("Net Export and Import of ", vc, "s per year, ", when,
+         " (age 2-8 vehicles; ", basis, "). ",
+         "Includes vehicle movements associated with both population migration and vehicle markets.")
+}
+
+if (render_sankeys) {
+  for (vc in classes) {
+    for (y in 2014:2024) {
+      df <- rates |>
+        filter(VehicleClass == vc, year == y, !is.na(count)) |>
+        select(STNAME = statename, flow = count, rate)
+      s <- make_sankey(df,
+                       sankey_title(vc, paste("yearpair", yp_label(y)),
+                                    paste0(method_label, "; that yearpair's rate × that year's stock")),
+                       extra_note = spike_note(vc, y))
+      save_sankey(s, sankey_stem(vc, yp_label(y)))
+    }
+    for (ys in c("yrs_all", "yrs_excl")) {
+      df <- win_avg |>
+        filter(year_set == ys, VehicleClass == vc, !is.na(Average_stock)) |>
+        select(STNAME = statename, flow = Average_stock, rate = Average)
+      s <- make_sankey(df, sankey_title(vc, paste("averaged over", year_set_labels[ys]),
+                                        paste0(method_label, "; mean of the per-yearpair counts")))
+      save_sankey(s, sankey_stem(vc, paste0("avg_", ys)))
+    }
+  }
+}
+```
+
+::: {.panel-tabset}
+```{r sankey-gallery}
+#| results: asis
+for (vc in classes) {
+  cat("\n## ", vc, "\n\n", sep = "")
+  cat(":::: {layout-ncol=3}\n")
+  for (p in c(yp_label(2014:2024), "avg_yrs_excl", "avg_yrs_all")) {
+    f <- file.path("est net flows", "by_year", "sankey", paste0(sankey_stem(vc, p), ".png"))
+    cat("![", p, "](", URLencode(f), ")\n\n", sep = "")
+  }
+  cat("::::\n")
+}
+```
+:::
+
+## How much do the top exporters and importers change?
+
+```{r top15-membership}
+#| fig-width: 15
+#| fig-height: 12
+period_flows <- bind_rows(
+  rates |>
+    filter(!is.na(count)) |>
+    transmute(VehicleClass, statename, period = yearpair, flow = count),
+  win_avg |>
+    filter(year_set %in% c("yrs_all", "yrs_excl")) |>
+    transmute(VehicleClass, statename,
+              period = if_else(year_set == "yrs_all", "avg all", "avg excl"),
+              flow = Average_stock)
+)
+
+top15 <- period_flows |>
+  mutate(exp_rank = rank(if_else(flow < 0, flow, NA), na.last = "keep", ties.method = "min"),
+         imp_rank = rank(if_else(flow > 0, -flow, NA), na.last = "keep", ties.method = "min"),
+         rank = coalesce(exp_rank, imp_rank),
+         role = case_when(exp_rank <= 15 ~ "Top-15 exporter",
+                          flow < 0       ~ "Other exporter",
+                          imp_rank <= 15 ~ "Top-15 importer",
+                          .default       = "Other importer"),
+         .by = c(VehicleClass, period))
+
+# top-k exporter / importer sets for every class x period
+top_sets <- function(k) {
+  top15 |>
+    summarise(exp = list(statename[!is.na(exp_rank) & exp_rank <= k]),
+              imp = list(statename[!is.na(imp_rank) & imp_rank <= k]),
+              .by = c(VehicleClass, period))
+}
+
+# how many of each yearpair's top-k are also top-k in the reference: the
+# yrs_excl averaged Sankey, or the previous yearpair's Sankey
+overlap_counts <- function(k) {
+  sets <- top_sets(k) |> filter(period %in% yp_label(2014:2024))
+  vs_avg <- top_sets(k) |>
+    filter(period == "avg excl") |>
+    select(VehicleClass, ref_exp = exp, ref_imp = imp)
+  vs_prev <- sets |>
+    mutate(period = yp_label(as.integer(str_sub(period, 1, 4)) + 1)) |>
+    select(VehicleClass, period, ref_exp = exp, ref_imp = imp)
+  bind_rows(
+    `yrs_excl average`   = left_join(sets, vs_avg, by = join_by(VehicleClass)),
+    `previous yearpair`  = inner_join(sets, vs_prev, by = join_by(VehicleClass, period)),
+    .id = "reference") |>
+    transmute(reference, VehicleClass, period, k = k,
+              exporters = map2_int(exp, ref_exp, \(a, b) length(intersect(a, b))),
+              importers = map2_int(imp, ref_imp, \(a, b) length(intersect(a, b))))
+}
+
+overlap <- bind_rows(overlap_counts(15), overlap_counts(5))
+
+overlap |> write_csv(file.path(out_dir, "top_k_overlap_by_yearpair.csv"))
+
+overlap |>
+  pivot_longer(c(exporters, importers), names_to = "side", values_to = "in_common") |>
+  summarise(median = median(in_common), min = min(in_common),
+            worst = str_flatten(period[in_common == min(in_common)], ", "),
+            .by = c(reference, k, VehicleClass, side)) |>
+  mutate(VehicleClass = factor(VehicleClass, levels = classes)) |>
+  arrange(desc(reference), desc(k), VehicleClass, side) |>
+  transmute(`Compared with` = reference, `Top k` = k, Class = VehicleClass, Side = side,
+            `Median in common` = paste0(median, " of ", k),
+            `Fewest in common` = paste0(min, " of ", k), `In yearpair(s)` = worst) |>
+  knitr::kable(caption = "How many of each yearpair's top-k states are also top-k in the comparison Sankey")
+
+role_cols <- c("Top-15 exporter" = col_exp, "Other exporter" = "#d9c2df",
+               "Top-15 importer" = col_imp, "Other importer" = "#f6d5b5")
+
+top15_plot <- top15 |>
+  left_join(filter(win_avg, year_set == "yrs_excl") |> select(VehicleClass, statename, ref = Average_stock),
+            by = join_by(VehicleClass, statename)) |>
+  mutate(VehicleClass = factor(VehicleClass, levels = classes),
+         period = factor(period, levels = col_levels),
+         row = fct_reorder(paste0(statename, "___", VehicleClass), ref),
+         role = factor(role, levels = names(role_cols)))
+
+p_top <- ggplot(top15_plot, aes(period, row, fill = role)) +
+  geom_tile(color = "white", linewidth = 0.3) +
+  geom_text(aes(label = rank), data = filter(top15_plot, rank <= 15),
+            size = 2, color = "white") +
+  geom_vline(xintercept = 11.5, color = col_ink2, linewidth = 0.4) +
+  facet_wrap(vars(VehicleClass), scales = "free_y", nrow = 1) +
+  scale_y_discrete(labels = \(x) str_remove(x, "___.*$")) +
+  scale_x_discrete(labels = \(x) if_else(x %in% yp_label(excl_years), paste0(x, "*"), x)) +
+  scale_fill_manual(values = role_cols, name = NULL) +
+  labs(title = "Who makes the Sankey's top 15, yearpair by yearpair?",
+       subtitle = "Number = rank by count within exporters / importers. Rows ordered by the yrs_excl average count. * = dropped from yrs_excl.",
+       x = NULL, y = NULL) +
+  theme_nb +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 7),
+        axis.text.y = element_text(size = 6.5),
+        panel.grid.major = element_blank())
+
+ggsave(file.path(out_dir, "top15_membership_by_yearpair.png"),
+       plot = p_top, width = 15, height = 12, dpi = 150)
+p_top
+```
+
+## Balance between gross imports and gross exports
+
+```{r balance-by-year}
+#| fig-width: 10
+#| fig-height: 4.5
+gross <- function(df, ...) {
+  df |>
+    summarise(gross_imports = sum(pmax(flow, 0)),
+              gross_exports = sum(-pmin(flow, 0)),
+              .by = c(...)) |>
+    mutate(imports_pct_of_exports = gross_imports / gross_exports)
+}
+
+balance_year <- rates |>
+  filter(!is.na(count)) |>
+  rename(flow = count) |>
+  gross(VehicleClass, year) |>
+  mutate(basis = "per yearpair")
+
+balance_win <- win_avg |>
+  filter(!is.na(Average_stock)) |>
+  rename(flow = Average_stock) |>
+  gross(VehicleClass, year_set) |>
+  mutate(basis = "window average")
+
+p_bal <- balance_year |>
+  mutate(VehicleClass = factor(VehicleClass, levels = classes)) |>
+  ggplot(aes(year, imports_pct_of_exports)) +
+  annotate("rect", xmin = excl_years - 0.5, xmax = excl_years + 0.5,
+           ymin = -Inf, ymax = Inf, fill = col_band) +
+  geom_hline(yintercept = 1, color = col_base, linewidth = 0.4) +
+  geom_hline(aes(yintercept = imports_pct_of_exports, color = year_set, linetype = year_set),
+             data = balance_win |> filter(year_set %in% c("yrs_all", "yrs_excl")) |>
+               mutate(VehicleClass = factor(VehicleClass, levels = classes)),
+             linewidth = 0.5) +
+  geom_line(color = col_ink, linewidth = 0.7) +
+  geom_point(color = col_ink, size = 1.8) +
+  facet_wrap(vars(VehicleClass)) +
+  scale_color_manual(values = col_win, labels = year_set_labels[names(col_win)],
+                     name = "Averaged Sankey") +
+  scale_linetype_manual(values = c(yrs_all = "solid", yrs_excl = "22"),
+                        labels = year_set_labels[names(col_win)], name = "Averaged Sankey") +
+  scale_x_continuous(breaks = c(2014, 2017, 2020, 2023), labels = yp_label) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "Gross imports as % of gross exports: per-yearpair Sankeys vs averaged Sankeys",
+       subtitle = "National-survival weights; black = that yearpair's Sankey; 100% = balanced. Shaded: 2020/21 and 2022/23.",
+       x = "Yearpair", y = "Imports as % of exports") +
+  theme_nb
+
+ggsave(file.path(out_dir, "balance_by_yearpair.png"),
+       plot = p_bal, width = 10, height = 4.5, dpi = 150)
+p_bal
+
+p_gross <- balance_year |>
+  mutate(VehicleClass = factor(VehicleClass, levels = classes)) |>
+  ggplot(aes(year, gross_exports)) +
+  annotate("rect", xmin = excl_years - 0.5, xmax = excl_years + 0.5,
+           ymin = -Inf, ymax = Inf, fill = col_band) +
+  geom_hline(aes(yintercept = gross_exports, color = year_set, linetype = year_set),
+             data = balance_win |> filter(year_set %in% c("yrs_all", "yrs_excl")) |>
+               mutate(VehicleClass = factor(VehicleClass, levels = classes)),
+             linewidth = 0.5) +
+  geom_line(color = col_ink, linewidth = 0.7) +
+  geom_point(color = col_ink, size = 1.8) +
+  facet_wrap(vars(VehicleClass)) +
+  scale_color_manual(values = col_win, labels = year_set_labels[names(col_win)],
+                     name = "Averaged Sankey") +
+  scale_linetype_manual(values = c(yrs_all = "solid", yrs_excl = "22"),
+                        labels = year_set_labels[names(col_win)], name = "Averaged Sankey") +
+  scale_x_continuous(breaks = c(2014, 2017, 2020, 2023), labels = yp_label) +
+  scale_y_continuous(labels = scales::comma, limits = c(0, NA)) +
+  labs(title = "Gross exports (sum over exporting states): per-yearpair vs averaged Sankeys",
+       subtitle = "Averaging counts across yearpairs cancels states that switch sign, so averaged Sankeys show less gross movement than any single yearpair",
+       x = "Yearpair", y = "Vehicles per year") +
+  theme_nb
+
+ggsave(file.path(out_dir, "gross_exports_by_yearpair.png"),
+       plot = p_gross, width = 10, height = 4.5, dpi = 150)
+p_gross
+
+balance_tbl <- bind_rows(
+  balance_year |> transmute(VehicleClass, period = yp_label(year), gross_exports, gross_imports, imports_pct_of_exports),
+  balance_win |> transmute(VehicleClass, period = paste("avg", year_set), gross_exports, gross_imports, imports_pct_of_exports)
+)
+balance_tbl |> write_csv(file.path(out_dir, "balance_by_yearpair_and_window.csv"))
+
+balance_tbl |>
+  mutate(VehicleClass = factor(VehicleClass, levels = classes),
+         value = paste0(pct(imports_pct_of_exports, 0.1), " (", scales::comma(round(gross_exports, -3)), ")")) |>
+  select(period, VehicleClass, value) |>
+  pivot_wider(names_from = VehicleClass, values_from = value) |>
+  knitr::kable(caption = "Gross imports as % of gross exports (gross exports, vehicles/yr)")
+```
+
+# 4. Matching gross imports and gross exports: age-mix accounting
+
+## Where the gap comes from
+
+The production count for state *s* is its rate times its whole age 2-8 stock:
+
+count~s~ = stock~s~ × Σ~a~ w̃~a~ d~s,a~,
+
+where d~s,a~ is the state-minus-national survival difference at age *a* and w̃~a~ are the normalised national cumulative-survival weights (a synthetic, stationary national age mix, the same for every state).
+
+National survival at each age is the pooled ratio over the 51 states (checked below), so for every age the stock-weighted survival differences cancel exactly: Σ~s~ n~s,a~ d~s,a~ = 0, where n~s,a~ is the state's actual stock at age *a* in year *t*. The production counts don't cancel because they weight each state's d~s,a~ by stock~s~ × w̃~a~ instead of by n~s,a~. The national gap therefore splits exactly into two parts:
+
+- **national age mix vs. synthetic weights:** Σ~a~ (w̃~a~ − p~a~) Σ~s~ stock~s~ d~s,a~, with p~a~ the actual national age mix;
+- **state age mix vs. national age mix:** Σ~s~ stock~s~ Σ~a~ (p~a~ − p~s,a~) d~s,a~, with p~s,a~ the state's own age mix.
+
+## The alternative: count survivors against national survival, age by age
+
+count~s~ = Σ~a~ n~s,a~ d~s,a~ = Σ~a~ [observed survivors~s,a~ − national survival~a~ × n~s,a~]
+
+This is the number of age 2-8 vehicles the state has in year *t*+1 beyond what national survival would leave it, which is the literal survival-residual definition of net migration. Its rate (count ÷ stock) is the state's survival differences weighted by its *own* observed age mix instead of the synthetic national one. Gross imports equal gross exports by construction in every yearpair; nothing is rescaled.
+
+Since 2026-10-14, `survival.qmd`'s production Sankeys use these counts for their vehicle numbers and ribbon widths (`Average_agemix`). The % labels, maps and the stability analysis above keep the national-survival-weighted rate, which is age-standardized and so comparable across states regardless of fleet age. The age-mix Sankeys below are drawn the same way, so their % labels match the production ones.
+
+```{r agemix-accounting}
+age_counts <- read_csv(file.path(data_dir, "pipeline_state_survival_14to25.csv"),
+                       show_col_types = FALSE) |>
+  filter(Age1 >= 2, Age1 <= 8) |>
+  transmute(year = as.integer(str_sub(as.character(year_pair), 1, 4)),
+            statename = state_name, VehicleClass, age = Age1,
+            n_t = CY1, n_t1 = CY2)
+
+nat_counts <- read_csv(file.path(data_dir, "pipeline_national_survival_14to25.csv"),
+                       show_col_types = FALSE) |>
+  filter(Age1 >= 2, Age1 <= 8) |>
+  transmute(year = as.integer(str_sub(as.character(year_pair), 1, 4)),
+            VehicleClass, age = Age1, N_t = CY1, N_t1 = CY2)
+
+# national survival is exactly the pooled ratio of the 51 states
+pooled <- age_counts |>
+  summarise(s_t = sum(n_t), s_t1 = sum(n_t1), .by = c(year, VehicleClass, age)) |>
+  inner_join(nat_counts, by = join_by(year, VehicleClass, age))
+stopifnot(nrow(pooled) == 11 * 3 * 7, all(pooled$s_t == pooled$N_t), all(pooled$s_t1 == pooled$N_t1))
+
+nat_age <- nat_counts |>
+  arrange(VehicleClass, year, age) |>
+  mutate(S_nat = N_t1 / N_t,
+         w     = cumprod(S_nat),
+         w_n   = w / sum(w),           # production's synthetic age weights
+         p_nat = N_t / sum(N_t),       # actual national age mix
+         .by = c(VehicleClass, year))
+
+ages <- age_counts |>
+  left_join(nat_age, by = join_by(year, VehicleClass, age)) |>
+  mutate(d       = n_t1 / n_t - S_nat,
+         stock_s = sum(n_t),
+         p_s     = n_t / stock_s,
+         .by = c(year, statename, VehicleClass))
+
+agemix <- ages |>
+  summarise(rate_rebuilt  = sum(w_n * d),
+            count_agemix  = sum(n_t1 - S_nat * n_t),
+            stock_s       = first(stock_s),
+            .by = c(VehicleClass, statename, year)) |>
+  mutate(rate_agemix = count_agemix / stock_s) |>
+  left_join(select(rates, VehicleClass, statename, year, yearpair, rate, count, stock, tn_outlier),
+            by = join_by(VehicleClass, statename, year))
+
+# the production rates rebuild exactly from the age-level counts (DC Pickup
+# 2016/17 is NA in production because one age's survival is >= 2 and gets
+# trimmed; the counts themselves are fine, so the age-mix version keeps it)
+rebuilt <- agemix |> filter(!is.na(rate))
+stopifnot(max(abs(rebuilt$rate_rebuilt - rebuilt$rate)) < 1e-12,
+          all(agemix$stock_s == agemix$stock))
+
+# and the age-mix counts sum to zero nationally in every class x yearpair
+agemix_net <- agemix |> summarise(net = sum(count_agemix), .by = c(VehicleClass, year))
+stopifnot(max(abs(agemix_net$net)) < 1e-3)
+
+# exact decomposition of the production gap
+gap_decomp <- ages |>
+  mutate(D = sum(stock_s * d), .by = c(VehicleClass, year, age)) |>
+  summarise(gap_total   = sum(stock_s * w_n * d),
+            gap_natmix  = sum((w_n - p_nat) * stock_s * d),
+            gap_statemix = sum(stock_s * (p_nat - p_s) * d),
+            .by = c(VehicleClass, year)) |>
+  left_join(select(balance_year, VehicleClass, year, gross_exports),
+            by = join_by(VehicleClass, year))
+stopifnot(max(abs(gap_decomp$gap_total - gap_decomp$gap_natmix - gap_decomp$gap_statemix)) < 1e-6)
+
+agemix |>
+  transmute(VehicleClass, statename, year, yearpair, stock,
+            rate_production = rate, count_production = count,
+            rate_agemix, count_agemix, tn_outlier) |>
+  arrange(VehicleClass, statename, year) |>
+  write_csv(file.path(out_dir, "netimports_by_year_production_vs_agemix.csv"))
+
+gap_decomp |>
+  mutate(VehicleClass = factor(VehicleClass, levels = classes)) |>
+  arrange(VehicleClass, year) |>
+  transmute(Class = VehicleClass, Yearpair = yp_label(year),
+            `Production gap (veh/yr)` = scales::comma(round(gap_total, -2)),
+            `Gap / gross exports` = pct(gap_total / gross_exports, 0.1),
+            `from national age mix` = pct(gap_natmix / gap_total),
+            `from state age mixes` = pct(gap_statemix / gap_total)) |>
+  knitr::kable(caption = "Production net national imbalance (gross imports − gross exports) and its exact split. Shares can exceed 100% when the two parts have opposite signs. (DC Pickup 2016/17, NA in production, is included here.)")
+```
+
+```{r agemix-national-mix}
+#| fig-width: 10
+#| fig-height: 4
+p_mix <- nat_age |>
+  filter(year %in% c(2014, 2019, 2024)) |>
+  select(VehicleClass, year, age, `synthetic weights (production)` = w_n, `actual national age mix` = p_nat) |>
+  pivot_longer(c(`synthetic weights (production)`, `actual national age mix`),
+               names_to = "series", values_to = "share") |>
+  mutate(VehicleClass = factor(VehicleClass, levels = classes),
+         yearpair = yp_label(year)) |>
+  ggplot(aes(age, share, color = yearpair, linetype = series)) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 1.5) +
+  facet_wrap(vars(VehicleClass)) +
+  scale_color_manual(values = c("2014/15" = "#86b6ef", "2019/20" = "#2a78d6", "2024/25" = "#104281"),
+                     name = "Yearpair") +
+  scale_linetype_manual(values = c(`synthetic weights (production)` = "22", `actual national age mix` = "solid"),
+                        name = NULL) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     breaks = seq(0.06, 0.22, by = 0.02)) +
+  scale_x_continuous(breaks = 2:8) +
+  labs(title = "Production's synthetic age weights vs the actual national age 2-8 mix",
+       subtitle = "The synthetic weights barely move; the actual car fleet has aged sharply (few 2020-22 model years)",
+       x = "Age in year t", y = "Share of age 2-8 stock") +
+  theme_nb +
+  guides(color = guide_legend(order = 1), linetype = guide_legend(order = 2))
+
+ggsave(file.path(out_dir, "agemix_synthetic_vs_actual_weights.png"),
+       plot = p_mix, width = 10, height = 4, dpi = 150)
+p_mix
+```
+
+## Side by side
+
+```{r agemix-compare}
+#| fig-width: 10
+#| fig-height: 4.5
+agemix_fit <- agemix |>
+  filter(!is.na(rate), !tn_outlier) |>
+  summarise(r2 = cor(rate, rate_agemix)^2,
+            slope = coef(lm(rate_agemix ~ rate))[[2]],
+            mean_abs_diff = mean(abs(rate_agemix - rate)),
+            max_abs_diff = max(abs(rate_agemix - rate)),
+            mean_diff = mean(rate_agemix - rate),
+            rho_counts = cor(count, count_agemix, method = "spearman"),
+            .by = VehicleClass)
+
+agemix_fit |>
+  mutate(VehicleClass = factor(VehicleClass, levels = classes)) |>
+  arrange(VehicleClass) |>
+  transmute(Class = VehicleClass, `R²` = round(r2, 3), Slope = round(slope, 3),
+            `Mean |diff| (pp)` = round(100 * mean_abs_diff, 2),
+            `Max |diff| (pp)` = round(100 * max_abs_diff, 2),
+            `Mean diff (pp)` = round(100 * mean_diff, 2),
+            `Spearman, counts` = round(rho_counts, 3)) |>
+  knitr::kable(caption = "Age-mix vs production rates, all state × yearpairs (TN 2014/15 excluded)")
+
+balance_agemix <- agemix |>
+  rename(flow = count_agemix) |>
+  gross(VehicleClass, year) |>
+  mutate(basis = "age-mix accounting")
+
+p_bal2 <- bind_rows(mutate(balance_year, basis = "production (rate × stock)"), balance_agemix) |>
+  mutate(VehicleClass = factor(VehicleClass, levels = classes)) |>
+  ggplot(aes(year, imports_pct_of_exports, color = basis)) +
+  geom_hline(yintercept = 1, color = col_base, linewidth = 0.4) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 1.8) +
+  facet_wrap(vars(VehicleClass)) +
+  scale_color_manual(values = c(`production (rate × stock)` = col_ink, `age-mix accounting` = "#1baf7a"),
+                     name = NULL) +
+  scale_x_continuous(breaks = c(2014, 2017, 2020, 2023), labels = yp_label) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "Gross imports as % of gross exports, per yearpair: production vs age-mix accounting",
+       subtitle = "Age-mix accounting balances to exactly 100% by construction; nothing is rescaled",
+       x = "Yearpair", y = "Imports as % of exports") +
+  theme_nb
+
+ggsave(file.path(out_dir, "balance_production_vs_agemix.png"),
+       plot = p_bal2, width = 10, height = 4.5, dpi = 150)
+p_bal2
+
+p_scatter <- agemix |>
+  filter(!is.na(rate), !tn_outlier) |>
+  mutate(VehicleClass = factor(VehicleClass, levels = classes)) |>
+  ggplot(aes(rate, rate_agemix)) +
+  geom_abline(color = col_base, linewidth = 0.4) +
+  geom_point(color = "#2a78d6", size = 1, alpha = 0.6) +
+  facet_wrap(vars(VehicleClass)) +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "Per state × yearpair rate: production vs age-mix accounting",
+       x = "Production rate (synthetic national age weights)",
+       y = "Age-mix rate (state's own age mix)") +
+  theme_nb
+
+ggsave(file.path(out_dir, "rates_production_vs_agemix.png"),
+       plot = p_scatter, width = 10, height = 4.5, dpi = 150)
+p_scatter
+```
+
+```{r agemix-sankeys}
+#| results: hide
+# age-mix Sankeys, drawn like survival.qmd's production Sankeys: age-mix
+# counts for the ribbons and numbers, the national-survival-weighted rate
+# for the % labels. Every yearpair, plus window averages built the same way
+# as production's (mean of per-yearpair values; TN 2014/15 dropped)
+agemix_win <- imap(year_sets[c("yrs_all", "yrs_excl")], \(yrs, nm) {
+  agemix |>
+    filter(year %in% yrs, !tn_outlier) |>
+    summarise(flow = mean(count_agemix), rate = mean(rate, na.rm = TRUE),
+              .by = c(VehicleClass, statename)) |>
+    mutate(year_set = nm)
+}) |>
+  list_rbind()
+
+agemix_basis <- paste0("counts: survivors vs national survival, age by age; ",
+                       "%: ", method_label)
+
+if (render_sankeys) {
+  for (vc in classes) {
+    for (y in 2014:2024) {
+      df <- agemix |>
+        filter(VehicleClass == vc, year == y) |>
+        select(STNAME = statename, flow = count_agemix, rate)
+      s <- make_sankey(df,
+                       sankey_title(vc, paste("yearpair", yp_label(y)), agemix_basis),
+                       extra_note = spike_note(vc, y))
+      save_sankey(s, sankey_stem(vc, yp_label(y), "agemix"))
+    }
+    for (ys in c("yrs_all", "yrs_excl")) {
+      df <- agemix_win |>
+        filter(year_set == ys, VehicleClass == vc) |>
+        select(STNAME = statename, flow, rate)
+      s <- make_sankey(df,
+                       sankey_title(vc, paste("averaged over", year_set_labels[ys]), agemix_basis),
+                       extra_note = "Tennessee 2014/15 dropped as in production, so this window is not exactly balanced.")
+      save_sankey(s, sankey_stem(vc, paste0("avg_", ys), "agemix"))
+    }
+  }
+}
+```
+
+Left: production. Right: age-mix accounting. Car 2023/24 and 2024/25 are where the production gap is largest (132%); SUV 2024/25 is shown for comparison.
+
+```{r agemix-gallery}
+#| results: asis
+pairs <- tribble(
+  ~vc,   ~period,
+  "Car", "2023/24",
+  "Car", "2024/25",
+  "SUV", "2024/25",
+  "Car", "avg_yrs_excl"
+)
+for (i in seq_len(nrow(pairs))) {
+  cat("\n:::: {layout-ncol=2}\n")
+  for (v in c("old", "agemix")) {
+    f <- file.path("est net flows", "by_year", "sankey",
+                   paste0(sankey_stem(pairs$vc[i], pairs$period[i], v), ".png"))
+    cat("![", pairs$vc[i], " ", pairs$period[i], ", ", v, "](", URLencode(f), ")\n\n", sep = "")
+  }
+  cat("::::\n")
+}
+```
+
+# 5. Conclusions
+
+```{r conclusion-numbers}
+n_verdict <- function(vc, v) sum(stability$VehicleClass == vc & stability$verdict_group == v)
+states_with <- function(v, vc = classes) {
+  stability |>
+    filter(verdict_group == v, VehicleClass %in% vc) |>
+    summarise(classes = str_flatten(VehicleClass, "/"), .by = statename) |>
+    mutate(txt = paste0(statename, " (", classes, ")")) |>
+    pull(txt) |>
+    str_flatten_comma(", and ")
+}
+bal_rng <- balance_year |>
+  summarise(lo = min(imports_pct_of_exports), hi = max(imports_pct_of_exports), .by = VehicleClass)
+win_bal <- balance_win |> filter(year_set == "yrs_excl")
+gross_ratio <- balance_year |>
+  summarise(mean_year = mean(gross_exports), .by = VehicleClass) |>
+  left_join(filter(balance_win, year_set == "yrs_all") |> select(VehicleClass, avg = gross_exports),
+            by = join_by(VehicleClass)) |>
+  mutate(ratio = avg / mean_year)
+sign_flipped <- stability |>
+  filter(flag_spike, sign(avg_all) != sign(avg_no_spikes)) |>
+  summarise(classes = str_flatten(VehicleClass, "/"), .by = statename) |>
+  mutate(txt = paste0(statename, " (", classes, ")")) |>
+  pull(txt) |>
+  str_flatten_comma(", and ")
+ov15   <- overlap |> filter(k == 15, reference == "yrs_excl average")
+ov5    <- overlap |> filter(k == 5, reference == "yrs_excl average")
+ov15_p <- overlap |> filter(k == 15, reference == "previous yearpair")
+```
+
+**Stability.** Most states' averages hold up. Of the 51 states, `r n_verdict("Car", "Stable")` (Car), `r n_verdict("SUV", "Stable")` (SUV) and `r n_verdict("Pickup", "Stable")` (Pickup) keep the same importer/exporter role in at least 80% of yearpairs with no material spike or trend. State rankings are persistent: persistent between-state differences account for `r pct(min(var_share$between_share[var_share$sample == "spikes removed"]))`–`r pct(max(var_share$between_share[var_share$sample == "spikes removed"]))` of the state-yearpair variance once spikes are removed, and adjacent yearpairs' rankings correlate at ρ ≈ `r round(median(rank_cor[["vs previous yearpair"]], na.rm = TRUE), 2)` (median).
+
+The averages that are *not* stable fall into three groups:
+
+- **Spike-driven averages:** `r states_with("Spike-driven average")`. One or two yearpairs with registration-data jumps (+15% to +28% of the state's stock in a single year in 2022/23, usually in all three classes at once) move the all-years average by at least 0.5 pp. For `r sign_flipped` the spike flips the sign of the all-years average, so the `yrs_all` Sankey puts them on the wrong side. `yrs_excl` drops the 2022/23 spikes, but the 2016/17 (Michigan Car, DC SUV) and 2024/25 (Oklahoma Car −19%, Rhode Island Car and SUV −11% to −14%) spikes are still inside it.
+- **Trending:** `r states_with("Trending")`. The rate drifts by ≥ 1 pp over the decade (BH-adjusted q < 0.05), so the average depends on the window.
+- **Role flips:** `r states_with("Role flips")`. These are mostly near-zero states (|average| ≲ 1.3%) whose sign switches from year to year; their Sankey side (importer vs exporter) in any averaged diagram is not meaningful. Oklahoma is different: its Car and SUV rates step down from around −1% before 2020/21 to −7% to −10% (Car, then −19% in 2024/25) and −3% to −11% (SUV) from 2021/22 on. That is a level shift, which looks more like a data or coverage change than a gradual trend.
+
+**Per-yearpair Sankeys vs averages.** The top of each Sankey is steady: the median yearpair shares `r median(ov15$exporters)` of 15 top exporters and `r median(ov15$importers)` of 15 top importers with the `yrs_excl` averaged Sankey (top 5: `r median(ov5$exporters)` and `r median(ov5$importers)` of 5), and `r median(ov15_p$exporters)` / `r median(ov15_p$importers)` of 15 with the previous yearpair. The lower ranks churn, and two things reshuffle the top. First, spike yearpairs: in 2022/23 Virginia, Missouri and Maryland become the three largest Car and SUV importers. Second, large-stock states near zero: Texas Car is a top-3 exporter in 2015/16 and 2016/17 and the #1 importer in four other yearpairs, yet only a minor importer in the averages. Gross movement is larger in any single yearpair than in the averaged Sankeys: the `yrs_all` averaged Car Sankey shows `r pct(gross_ratio$ratio[gross_ratio$VehicleClass == "Car"])` of the mean per-yearpair gross exports (SUV `r pct(gross_ratio$ratio[gross_ratio$VehicleClass == "SUV"])`, Pickup `r pct(gross_ratio$ratio[gross_ratio$VehicleClass == "Pickup"])`), because averaging counts cancels sign switches.
+
+**Balance.** Per yearpair, gross imports run `r pct(bal_rng$lo[bal_rng$VehicleClass == "Car"])`–`r pct(bal_rng$hi[bal_rng$VehicleClass == "Car"])` of gross exports for Car, `r pct(bal_rng$lo[bal_rng$VehicleClass == "SUV"])`–`r pct(bal_rng$hi[bal_rng$VehicleClass == "SUV"])` for SUV and `r pct(bal_rng$lo[bal_rng$VehicleClass == "Pickup"])`–`r pct(bal_rng$hi[bal_rng$VehicleClass == "Pickup"])` for Pickup (the `yrs_excl` averaged Sankeys: Car `r pct(win_bal$imports_pct_of_exports[win_bal$VehicleClass == "Car"], 0.1)`, SUV `r pct(win_bal$imports_pct_of_exports[win_bal$VehicleClass == "SUV"], 0.1)`, Pickup `r pct(win_bal$imports_pct_of_exports[win_bal$VehicleClass == "Pickup"], 0.1)`). Using per-yearpair data does not close the gap; Car is worst in 2023/24 and 2024/25. The gap is not estimation noise: it is exactly the error from applying one synthetic national age mix to every state's actual fleet, mostly the difference between state and national age mixes, plus (for Car since 2020/21) the national car fleet ageing away from the synthetic weights. Counting survivors age by age against national survival (age-mix accounting) balances every yearpair to exactly 100% without any rescaling, while changing state rates very little (R² ≥ `r round(min(agemix_fit$r2), 3)`; mean absolute change `r round(100 * min(agemix_fit$mean_abs_diff), 2)`–`r round(100 * max(agemix_fit$mean_abs_diff), 2)` pp). Since 2026-10-14 the production Sankeys in `survival.qmd` use these age-mix counts for vehicle numbers and ribbon widths, keeping the national-survival-weighted rate for their % labels.
