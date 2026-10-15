@@ -14,7 +14,7 @@ execute:
 
 # Purpose
 
-`survival.qmd` (Phase 1b) estimates each state's net used-vehicle import rate from state-vs-national survival differences (Greene/UTK method) and converts it to a vehicle count with that year's own age 2-8 VIO stock. Part of that net flow is simply vehicles travelling with people who move between states. This document:
+`survival.qmd` (Phase 1b) estimates each state's net used-vehicle import rate from state-vs-national survival differences (Greene/UTK method). It reports the rate with national-survival weights. Its vehicle counts come from **age-mix accounting**: each state's age 2-8 survivors minus what national survival would leave from its own year-*t* stock, age by age. These counts sum to exactly zero nationally in every yearpair. Part of that net flow is simply vehicles travelling with people who move between states. This document:
 
 1. parses the Census Bureau's ACS state-to-state migration flow tables into a tidy origin × destination × year table;
 2. builds per-state population inflow, outflow and net domestic migration (persons and % of population), with Sankeys in the same style as the vehicle ones;
@@ -22,7 +22,14 @@ execute:
 4. estimates **A**, the number of age 2-8 vehicles of a class that move per net migrant, in two transparent ways (structural per-capita fleet; empirical regression slope);
 5. removes `A × net domestic migration` from vehicle net imports, giving population-adjusted ("market") flows, with Sankeys, ranking comparisons and the share of vehicle net-flow variation that population migration accounts for.
 
-Vehicle inputs are the CSVs `survival.qmd` writes (`data/net_imports_long.csv`, `data/state_vehtype_stock_by_year.csv`, `data/net_imports_summary.csv`), using the `old` (national-survival weights) method, the production method. This document does not run any `survival.qmd` chunk. Outputs go to the git-ignored `est net flows/population/`.
+Vehicle inputs are the CSVs `survival.qmd` writes, using the `old` (national-survival weights) method, the production method:
+
+- `data/net_imports_agemix_counts.csv`: vehicle counts.
+- `data/net_imports_long.csv`: the weighted rates used for % labels.
+- `data/state_vehtype_stock_by_year.csv`: age 2-8 stock, for per-capita A and the % bases.
+- `data/net_imports_summary.csv`: full-window reference values, including `Average_agemix`.
+
+The age-mix counts and `Average_agemix` are written by the `survival.qmd` version on PR #3. This document does not run any `survival.qmd` chunk. Outputs go to the git-ignored `est net flows/population/`.
 
 ```{r setup}
 library(tidyverse)
@@ -490,15 +497,27 @@ vehstock <- read_csv(file.path(surv_data_dir, "state_vehtype_stock_by_year.csv")
                      show_col_types = FALSE) |>
   mutate(year = as.integer(year))
 
+# age-mix accounting counts (survival.qmd production counts): each state's
+# age 2-8 survivors minus what national survival would leave from its own
+# year-t stock, age by age; they sum to exactly zero nationally per yearpair
+agemix <- read_csv(file.path(surv_data_dir, "net_imports_agemix_counts.csv"),
+                   show_col_types = FALSE) |>
+  mutate(year = as.integer(year))
+
+# value = Greene's national-survival-weighted net import rate (the % labels);
+# veh_cnt = age-mix count (Sankey widths, regressions, residuals)
 veh <- read_csv(file.path(surv_data_dir, "net_imports_long.csv"),
                 show_col_types = FALSE) |>
   filter(method == "old") |>
   mutate(year = as.integer(year)) |>
   left_join(vehstock, by = join_by(year, statename, VehicleClass)) |>
-  mutate(veh_cnt  = value * stock,
+  left_join(agemix, by = join_by(VehicleClass, statename, year)) |>
+  mutate(veh_cnt  = count_agemix,
          acs_year = year + 1L,
-         # survival.qmd drops TN's outlier first yearpair from weighted averages
+         # survival.qmd drops TN's outlier first yearpair from weighted
+         # averages, for counts as well as rates
          excl_tn  = statename == "Tennessee" & year == 2014)
+stopifnot(!anyNA(veh$veh_cnt))
 
 net_imports_summary <- read_csv(file.path(surv_data_dir, "net_imports_summary.csv"),
                                 show_col_types = FALSE) |>
@@ -616,12 +635,14 @@ make_sankey <- function(df, title_text, units_note, rate_accuracy = 1,
 
   color_js <- 'd3.scaleOrdinal().domain(["exporter","pool","importer"]).range(["#7b2d8e","#aaaaaa","#e67e22"])'
 
+  # nodePadding 19 (was 13) keeps the 18px labels of the thinnest nodes
+  # (bottom of the exporter column) from overlapping each other
   s <- sankeyNetwork(
     Links = as.data.frame(links), Nodes = as.data.frame(nodes),
     Source = "source", Target = "target", Value = "value",
     NodeID = "name", NodeGroup = "group", colourScale = color_js,
     fontSize = 18, fontFamily = "sans-serif",
-    nodeWidth = 20, nodePadding = 13, sinksRight = TRUE,
+    nodeWidth = 20, nodePadding = 19, sinksRight = TRUE,
     width = 900, height = 900
   )
 
@@ -629,10 +650,13 @@ make_sankey <- function(df, title_text, units_note, rate_accuracy = 1,
     "Gross ", flow_word, " = ", scales::percent(actual_balance, accuracy = 0.1),
     " of gross ", out_word, " across states. ", units_note)
 
+  # the widget page is wider than the 920px screenshot, so cap the text width
+  # or long titles get cut off at the right edge of the PNG
+  text_style <- "max-width:860px; text-align:center; font-family:sans-serif;"
   htmlwidgets::prependContent(
     s,
-    htmltools::tags$h3(title_text, style = "text-align:center; font-family:sans-serif;"),
-    htmltools::tags$p(balance_note, style = "text-align:center; font-family:sans-serif; color:#555555;")
+    htmltools::tags$h3(title_text, style = text_style),
+    htmltools::tags$p(balance_note, style = paste(text_style, "color:#555555;"))
   )
 }
 
@@ -660,8 +684,12 @@ window_info <- window_years |>
            if (length(miss)) paste0("; no ACS for ", paste(yp_label(miss), collapse = ", ")) else "",
            if (nrow(flg)) paste0("; ", paste0(flg$statename, " excl. ", yp_label(flg$acs_year - 1L),
                                               collapse = ", ")) else "")
-  }))
-knitr::kable(window_info |> select(year_set, n_total, n_matched, window_note))
+  }),
+  # vehicle averages also drop Tennessee's outlier 2014/15 (production rule)
+  veh_window_note = paste0(window_note,
+                           if_else(map_lgl(matched, \(m) 2014L %in% m),
+                                   "; Tennessee excl. 2014/15", "")))
+knitr::kable(window_info |> select(year_set, n_total, n_matched, veh_window_note))
 ```
 
 # Population Sankeys
@@ -827,10 +855,12 @@ A_emp_fits <- reg_data |>
       filter(d, !statename %in% c("California", "New York", "Florida", "Texas")),
       fit_slope(veh_cnt, cbind(pop_net = pop_net), statename)),
     # rate form weights states equally; (a1) predicts a slope of 1 here
-    # (vehicle rate = A * pop_net / stock = pop_net / pop when A = stock / pop)
-    "(b) rate form: vehicle rate on pop. rate" =
-      fit_slope(d$value, cbind(int = 1, pop_net_rate = d$pop_net_rate), d$statename) |>
-        filter(term == "pop_net_rate"),
+    # (vehicle rate = A * pop_net / stock = pop_net / pop when A = stock / pop).
+    # Uses Greene's weighted rate, so it does not depend on the count basis
+    "(b) rate form: vehicle rate on pop. rate" = with(
+      filter(d, !is.na(value)),
+      fit_slope(value, cbind(int = 1, pop_net_rate = pop_net_rate), statename) |>
+        filter(term == "pop_net_rate")),
     .id = "spec"))) |>
   select(VehicleClass, fits) |>
   unnest(fits)
@@ -946,7 +976,7 @@ p_scatter <- veh_window_raw |>
   labs(x = "Net domestic migration (persons/yr)", y = "Vehicle net imports (age 2-8 vehicles/yr)",
        colour = NULL, linetype = NULL,
        title = "Vehicle net imports vs net domestic migration, by state",
-       subtitle = paste0("Averages over ", window_info$window_note[window_info$year_set == "yrs_all"])) +
+       subtitle = paste0("Averages over ", window_info$veh_window_note[window_info$year_set == "yrs_all"])) +
   theme(legend.position = "bottom")
 ggsave(file.path(out_dir, "fig_scatter_vehicle_vs_population_yrs_all.png"), p_scatter,
        width = 12, height = 5.5, dpi = 150, bg = "white")
@@ -976,13 +1006,15 @@ veh_adj <- veh_pop |>
          struct_od  = pop_veh_od,
          empirical  = A_emp * pop_net) |>
   pivot_longer(c(struct_nat, struct_od, empirical), names_to = "A_method", values_to = "pop_veh") |>
-  mutate(resid_cnt  = veh_cnt - pop_veh,
-         resid_rate = resid_cnt / stock,
-         pop_veh_rate = pop_veh / stock)
+  # residual % keeps Greene's weighted rate as the base: rate minus the
+  # population-attributable share of the state's age 2-8 stock
+  mutate(resid_cnt    = veh_cnt - pop_veh,
+         pop_veh_rate = pop_veh / stock,
+         resid_rate   = value - pop_veh_rate)
 
 write_csv(veh_adj |>
             select(A_method, VehicleClass, statename, year, yearpair, acs_year, excl_tn,
-                   stock, value, veh_cnt, pop, pop_net, pop_net_rate,
+                   stock, value, veh_cnt_agemix = veh_cnt, pop, pop_net, pop_net_rate,
                    pop_veh, pop_veh_rate, resid_cnt, resid_rate),
           file.path(out_dir, "vehicle_pop_adjusted_by_state_class_year.csv"))
 
@@ -992,18 +1024,20 @@ write_csv(veh_adj |>
 adj_window <- veh_adj |>
   filter(use) |>
   inner_join(window_years, by = join_by(year), relationship = "many-to-many") |>
+  # rates na.rm like survival.qmd's Average: DC Pickup 2016/17 has a count
+  # but no weighted rate
   summarise(raw_cnt      = mean(veh_cnt),
-            raw_rate     = mean(value),
+            raw_rate     = mean(value, na.rm = TRUE),
             pop_net      = mean(pop_net),
             pop_net_rate = mean(pop_net_rate),
             pop_veh      = mean(pop_veh),
             resid_cnt    = mean(resid_cnt),
-            resid_rate   = mean(resid_rate),
+            resid_rate   = mean(resid_rate, na.rm = TRUE),
             n_years      = n(),
             .by = c(A_method, year_set, VehicleClass, statename)) |>
   left_join(net_imports_summary |>
               select(year_set, VehicleClass, statename,
-                     raw_cnt_full_window = Average_stock, raw_rate_full_window = Average),
+                     raw_cnt_full_window = Average_agemix, raw_rate_full_window = Average),
             by = join_by(year_set, VehicleClass, statename)) |>
   mutate(rank_raw   = rank(-raw_cnt),
          rank_resid = rank(-resid_cnt),
@@ -1067,10 +1101,30 @@ p_curve
 
 # Population-adjusted vehicle Sankeys
 
-The residual is vehicle net imports minus $A \times$ net domestic migration, averaged over the ACS-matched yearpairs of each window. There is one set of Sankeys for each A: (a1) structural national (`struct_nat`), (a2) structural origin-state (`struct_od`) and (b) empirical (`empirical`). Raw vehicle Sankeys over the same matched yearpairs are also rendered (`sankey_vehicle_raw_*_matched`), so raw and adjusted can be compared like for like. The full-window raw Sankeys are in `survival.qmd`'s outputs. Rates are the residual as a share of the state's own age 2-8 stock, to the whole percent.
+The residual is vehicle net imports minus $A \times$ net domestic migration, averaged over the ACS-matched yearpairs of each window. There is one set of Sankeys for each A: (a1) structural national (`struct_nat`), (a2) structural origin-state (`struct_od`) and (b) empirical (`empirical`). Raw vehicle Sankeys over the same matched yearpairs are also rendered (`sankey_vehicle_raw_*_matched`), so raw and adjusted can be compared like for like. The full-window raw Sankeys are in `survival.qmd`'s outputs.
+
+Labels follow `survival.qmd`'s production hybrid:
+
+- **Counts and ribbon widths** are age-mix accounting counts.
+- **%** is Greene's national-survival-weighted net import rate, which is age-standardized.
+- **Residual Sankeys:** the count is the age-mix count minus A × net migrants. The % is the weighted rate minus A × net migrants as a share of the state's age 2-8 stock, to the whole percent.
+
+Age-mix counts sum to zero nationally in every yearpair, and so does A × net migration under (a1) and (b). Any import/export gap in these Sankeys therefore comes from state-specific exclusions: Tennessee 2014/15 (production rule) and Connecticut 2021/22 (Census-flagged ACS 2022). Under (a2), the national ratio given to 2024's suppressed in-migrant cells also adds a small gap.
 
 ```{r residual-sankeys}
-veh_units_note <- "Labels: vehicles/yr; % of the state's own age 2-8 stock per year."
+# same wording as survival.qmd's production Sankeys; age-mix counts and
+# A x net migration each sum to ~zero nationally per yearpair, so any
+# import/export gap comes from the state exclusions named in the title
+gap_note <- " Any gap between imports and exports comes from the state exclusions named in the title."
+veh_units_note <- paste0(
+  "Labels: vehicles/yr, each state's survivors counted age by age against national survival; ",
+  "% = net import rate with national-survival weights, of the state's own age 2-8 stock per year.",
+  gap_note)
+resid_units_note <- paste0(
+  "Labels: vehicles/yr, each state's survivors counted age by age against national survival, ",
+  "minus A × net domestic migrants; % = net import rate with national-survival weights minus ",
+  "A × net migrants, both as a share of the state's own age 2-8 stock per year.",
+  gap_note)
 A_label <- function(m, vc) {
   if (m == "struct_nat") {
     a <- A_struct_mean |> filter(VehicleClass == vc)
@@ -1086,13 +1140,13 @@ A_label <- function(m, vc) {
 }
 
 for (ys in names(year_sets)) {
-  wnote <- window_info$window_note[window_info$year_set == ys]
+  wnote <- window_info$veh_window_note[window_info$year_set == ys]
   for (vc in classes) {
     raw_df <- adj_window |>
       filter(A_method == "struct_nat", year_set == ys, VehicleClass == vc) |>
       select(STNAME = statename, flow = raw_cnt, rate = raw_rate)
     s <- make_sankey(raw_df, paste0(
-      "Net Export and Import of ", vc, "s per year (age 2-8 vehicles; old method: national-survival weights; averaged over ",
+      "Net Export and Import of ", vc, "s per year (age 2-8 vehicles; averaged over ",
       wnote, "). Includes vehicle movements associated with both population migration and vehicle markets."),
       veh_units_note)
     save_sankey(s, paste0("sankey_vehicle_raw_", str_to_lower(vc), "_", ys, "_matched"))
@@ -1103,9 +1157,9 @@ for (ys in names(year_sets)) {
         select(STNAME = statename, flow = resid_cnt, rate = resid_rate)
       s <- make_sankey(df, paste0(
         "Population-adjusted Net Export and Import of ", vc,
-        "s per year (age 2-8 vehicles; old method; net imports minus A × net domestic migrants, ",
+        "s per year (age 2-8 vehicles; net imports minus A × net domestic migrants, ",
         A_label(m, vc), " ", str_to_lower(vc), "s/person; averaged over ", wnote, ")"),
-        veh_units_note)
+        resid_units_note)
       save_sankey(s, paste0("sankey_residual_", str_to_lower(vc), "_", ys, "_", m))
     }
   }
@@ -1151,7 +1205,7 @@ plot_dumbbell <- function(ys) {
     labs(x = "Net imports (age 2-8 vehicles/yr)", y = NULL, colour = NULL,
          title = "Vehicle net imports by state: raw vs population-adjusted",
          subtitle = paste0("States ordered by raw value; averages over ",
-                           window_info$window_note[window_info$year_set == ys])) +
+                           window_info$veh_window_note[window_info$year_set == ys])) +
     theme(legend.position = "bottom", axis.text.y = element_text(size = 7))
 }
 # order states within each facet (no tidytext dependency)
@@ -1258,6 +1312,40 @@ knitr::kable(sign_dep |> mutate(across(c(raw_cnt, pop_veh_a1), \(x) round(x, -2)
              digits = 2, format.args = list(big.mark = ","),
              caption = "States whose adjusted sign depends on A (all matched yearpairs): sign flips at A = flips_at_multiple × (a1); k_empirical = A(b) / mean A(a1)")
 ```
+
+# Vehicle count basis: age-mix accounting vs rate × stock
+
+The first version of this analysis converted Greene's weighted rate to a count as rate × that year's age 2-8 stock. Production `survival.qmd` (PR #3) now uses age-mix accounting counts, and so does everything above. For reference, the key statistics on both bases are below, over the same state × yearpair cells (rate × stock drops DC Pickup 2016/17, which has no rate).
+
+```{r count-basis}
+basis_cmp <- veh_pop |>
+  filter(use) |>
+  left_join(A_struct_year |> select(VehicleClass, year, A_struct),
+            by = join_by(VehicleClass, year)) |>
+  mutate(`age-mix accounting` = veh_cnt, `rate x stock` = value * stock) |>
+  pivot_longer(c(`age-mix accounting`, `rate x stock`),
+               names_to = "count_basis", values_to = "cnt") |>
+  filter(!is.na(cnt)) |>
+  summarise(gross_flow   = sum(abs(cnt)) / n_distinct(year) / 2,
+            A_b          = sum(cnt * pop_net) / sum(pop_net^2),
+            explained_a1 = 1 - sum((cnt - A_struct * pop_net)^2) / sum(cnt^2),
+            explained_b  = 1 - sum((cnt - A_b * pop_net)^2) / sum(cnt^2),
+            .by = c(VehicleClass, count_basis)) |>
+  arrange(factor(VehicleClass, classes), count_basis)
+write_csv(basis_cmp, file.path(out_dir, "count_basis_comparison.csv"))
+knitr::kable(basis_cmp, digits = 3, format.args = list(big.mark = ","),
+             caption = "Key statistics by vehicle count basis (state x yearpair cells; gross_flow = mean yearly sum of |count| / 2)")
+
+basis_wide <- basis_cmp |>
+  select(VehicleClass, count_basis, A_b, explained_a1) |>
+  pivot_wider(names_from = count_basis, values_from = c(A_b, explained_a1))
+basis_val <- \(col, vc) sprintf("%.3f", basis_wide[[col]][basis_wide$VehicleClass == vc])
+```
+
+The structural A and the rate-form slopes do not depend on the count basis. The two count bases correlate at about 0.99 state by state, so the switch moves little:
+
+- **(b) empirical slope:** SUVs go from `r basis_val("A_b_rate x stock", "SUV")` to `r basis_val("A_b_age-mix accounting", "SUV")`. Cars (`r basis_val("A_b_rate x stock", "Car")` → `r basis_val("A_b_age-mix accounting", "Car")`) and pickups (`r basis_val("A_b_rate x stock", "Pickup")` → `r basis_val("A_b_age-mix accounting", "Pickup")`) barely change.
+- **Explained shares** shift by at most about two percentage points.
 
 # Discussion
 
@@ -1366,9 +1454,10 @@ All in `est net flows/population/` (git-ignored):
 | `population_net_migration_by_state_year.csv` | Inflow, outflow, net (persons), MOEs, net rate, from-abroad components, moves to PR |
 | `population_net_migration_window_avg.csv` | Window averages over ACS-matched years |
 | `A_estimates.csv` | All A estimates |
-| `vehicle_pop_adjusted_by_state_class_year.csv` | Raw, population-attributable and residual vehicle counts and rates, per A method |
+| `vehicle_pop_adjusted_by_state_class_year.csv` | Raw (age-mix) count and weighted rate, population-attributable and residual counts and rates, per A method |
 | `vehicle_pop_adjusted_window_avg.csv` | The same averaged over each window's matched yearpairs, with ranks and the full-window raw values |
 | `explained_share.csv`, `biggest_changes_yrs_all.csv` | Explained-share and largest-change tables |
+| `count_basis_comparison.csv` | A(b) and explained shares on age-mix vs rate × stock counts |
 | `sankey_population_acs<year>.*`, `sankey_population_<window>.*` | Population Sankeys |
 | `sankey_vehicle_raw_<class>_<window>_matched.*` | Raw vehicle Sankeys over ACS-matched yearpairs |
 | `sankey_residual_<class>_<window>_<struct_nat\|struct_od\|empirical>.*` | Population-adjusted vehicle Sankeys, by A |
