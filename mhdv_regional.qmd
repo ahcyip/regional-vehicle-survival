@@ -1,0 +1,748 @@
+---
+title: "MHDV regional survival and state net import/export of used vehicles"
+author: "arthur yip"
+format:
+  html:
+    embed-resources: true
+    toc: true
+execute:
+  warning: false
+  message: false
+---
+
+This is the medium- and heavy-duty counterpart of `survival.qmd`. It produces state survival curves, net import/export rates and counts, and Sankeys, with the same methods and graphics as the light-duty analysis. It extends the earlier MHDV port in `tempo-data/preprocessing/mhd-experian/mhdv_survival.qmd` (national and state survival, `old`-method rates) with:
+- age-mix accounting counts
+- Sankeys
+- window comparisons
+- import/export balance
+- per-pair stability checks
+- net-import maps
+
+**Data.** Experian MHDV stock interim files, `exp_<year>_MHD_stock_interim.csv`, built by `tempo-data/.../build_mhdv_survival_interim.R`:
+
+- **Snapshots:** Q4 of 2015, 2017, 2019, 2022, 2023, 2024 and 2025.
+- **Vehicles:** Class 2b–8. The Class 2b/3 rows come from the LDV extracts.
+- **Excluded:** RVs, fire and military vehicles.
+
+**Classes.** These are the EPA MOVES source-type buckets chosen in July 2026. One change: single-unit trucks are split by MOVES regulatory class into **Class 2b–3** and **Class 4–8**. Class 2b–3 (heavy pickups and vans, from the LDV extracts) is about 80% of single-unit stock and behaves more like light-duty, so pooling would hide genuine single-unit trucks.
+
+**Uneven snapshot gaps** (2/2/3/1/1/1 years). Each pair's survival covers its whole interval, so it is annualized as S^(1/Δ). Ages are anchored at the first snapshot of each pair. Net-import counts over an interval are divided by Δ to give vehicles per year.
+
+- **2019/22 pair:** spans COVID and Experian's switch from the historical single-national product to the current one. `yrs_excl` drops it, as in the earlier port.
+- **Windows:** these are defined by the first year of each pair, as in that port.
+
+**Methods**, as in the LDV production Sankeys:
+
+- **Rates:** Greene's national-survival-weighted ("old") net import rate. It is the annualized state-minus-national survival difference, weighted over ages 2-8 by cumulative national survival. This is an age-standardized rate, used for the maps and the stability analysis.
+- **Counts:** age-mix accounting, i.e. each state's age 2-8 survivors minus what national survival would leave from its own stock, age by age. The counts sum to exactly zero nationally in every pair, so gross imports equal gross exports without rescaling. Rate × stock counts are shown alongside, for comparison.
+- **Sankey % labels:** count ÷ the state's age 2-8 stock. This differs from the LDV Sankeys, which label with the national-weights rate. MHDV flows swing between pairs, and some pairs have no rate, so a mean of rates can contradict the side of the diagram a state is on.
+- **Consistency screen:** a class is left out of a pair when its national age 2-8 count grows or collapses between the two snapshots, which means it was re-coded (mostly buses; see the table below).
+
+```{r setup}
+library(tidyverse)
+library(geofacet)
+library(networkD3)
+
+# CONFIGURE: local copy of the MHDV interim files (copied from
+# /projects/tempo/experian/experian on Kestrel)
+directory <- "c:/users/ayip/OneDrive - NREL (1)/from eagle/experian/"
+
+data_dir <- here::here("est net flows", "mhdv", "data")
+out_dir  <- here::here("est net flows", "mhdv")
+sankey_dir <- file.path(out_dir, "sankey")
+walk(c(data_dir, out_dir, sankey_dir), \(d) dir.create(d, showWarnings = FALSE, recursive = TRUE))
+
+if (Sys.getenv("RSTUDIO_PANDOC") == "")
+  Sys.setenv(RSTUDIO_PANDOC = "C:/Program Files/RStudio/resources/app/bin/quarto/bin/tools")
+render_sankeys <- TRUE
+
+snapshot_years <- c(2015L, 2017L, 2019L, 2022L, 2023L, 2024L, 2025L)
+pairs <- tibble(year1 = head(snapshot_years, -1), year2 = tail(snapshot_years, -1)) |>
+  mutate(delta = year2 - year1,
+         pair  = paste0(year1, "/", str_sub(year2, 3, 4)))
+pair_levels <- pairs$pair
+
+year_sets <- list(
+  yrs_hist   = c(2015L, 2017L),
+  yrs_recent = c(2022L, 2023L, 2024L),
+  yrs_excl   = c(2015L, 2017L, 2022L, 2023L, 2024L),
+  yrs_all    = c(2015L, 2017L, 2019L, 2022L, 2023L, 2024L)
+)
+year_set_labels <- c(
+  yrs_hist   = "2015/17 & 2017/19",
+  yrs_recent = "2022/23–2024/25",
+  yrs_excl   = "all pairs excl. 2019/22",
+  yrs_all    = "all pairs"
+)
+
+class_labels <- c(
+  SU_2b3       = "Single-unit, Class 2b–3",
+  SU_4to8      = "Single-unit, Class 4–8",
+  Combination  = "Combination tractor",
+  SchoolBus    = "School bus",
+  TransitBus   = "Transit bus",
+  IntercityBus = "Intercity bus",
+  Refuse       = "Refuse truck",
+  YardTractor  = "Yard tractor (off-road)"
+)
+classes      <- names(class_labels)
+main_classes <- c("SU_2b3", "SU_4to8", "Combination", "SchoolBus", "TransitBus")
+
+pair_cols    <- setNames(c("#9ecae1", "#6baed6", "#eda100", "#3182bd", "#08519c", "#08306b"), pair_levels)
+yearset_cols <- c(yrs_hist = "#2a78d6", yrs_recent = "#1baf7a", yrs_excl = "#eda100", yrs_all = "#008300")
+
+theme_cmp <- theme_minimal(base_size = 10) +
+  theme(panel.grid.minor = element_blank(),
+        panel.grid.major = element_line(color = "#e1e0d9", linewidth = 0.3),
+        axis.text = element_text(color = "#52514e"),
+        plot.title = element_text(size = 12),
+        plot.subtitle = element_text(color = "#52514e"),
+        plot.title.position = "plot",
+        legend.position = "top")
+
+pct <- \(x, acc = 1) scales::percent(x, accuracy = acc)
+```
+
+# Phase 1: stock and survival by state, class and age
+
+```{r load}
+class_of <- function(src, reg) case_when(
+  src == "MOVES52_53_SingleUnit" & reg %in% "LHD2b3" ~ "SU_2b3",
+  src == "MOVES52_53_SingleUnit"                     ~ "SU_4to8",
+  src == "MOVES61_62_Combination"                    ~ "Combination",
+  src == "MOVES43_SchoolBus"                         ~ "SchoolBus",
+  src == "MOVES42_TransitBus"                        ~ "TransitBus",
+  src == "MOVES41_IntercityBus"                      ~ "IntercityBus",
+  src == "MOVES51_RefuseTruck"                       ~ "Refuse",
+  src == "YardTractor_offroad"                       ~ "YardTractor")
+
+stock_my <- map(snapshot_years, \(y) {
+  read_csv(paste0(directory, "exp_", y, "_MHD_stock_interim.csv"), show_col_types = FALSE,
+           col_select = c(vehicle_model_year, state_name, yip_tempo_class, moves_regclass, stock)) |>
+    filter(!is.na(state_name), !is.na(yip_tempo_class)) |>
+    mutate(VehicleClass = class_of(yip_tempo_class, moves_regclass)) |>
+    summarise(n = sum(stock), .by = c(state_name, VehicleClass, vehicle_model_year)) |>
+    mutate(year = y)
+}) |>
+  list_rbind() |>
+  rename(statename = state_name, MY = vehicle_model_year)
+
+stopifnot(!anyNA(stock_my$VehicleClass), n_distinct(stock_my$statename) == 51)
+
+stock_my |>
+  summarise(stock = sum(n), .by = c(year, VehicleClass)) |>
+  mutate(VehicleClass = factor(class_labels[VehicleClass], levels = class_labels)) |>
+  pivot_wider(names_from = year, values_from = stock) |>
+  arrange(VehicleClass) |>
+  mutate(across(-VehicleClass, scales::comma)) |>
+  knitr::kable(caption = "MHDV stock (all ages) by class and snapshot")
+```
+
+```{r pair-cells}
+# one row per pair x state x class x age (anchored at the pair's first year):
+# n1 = stock at year1, n2 = the same model years at year2
+state_cells <- pairs |>
+  pmap(\(year1, year2, delta, pair) {
+    full_join(stock_my |> filter(year == year1) |> select(statename, VehicleClass, MY, n1 = n),
+              stock_my |> filter(year == year2) |> select(statename, VehicleClass, MY, n2 = n),
+              by = join_by(statename, VehicleClass, MY)) |>
+      mutate(year1 = year1, delta = delta, pair = pair, age = year1 - MY,
+             across(c(n1, n2), \(x) coalesce(x, 0)))
+  }) |>
+  list_rbind() |>
+  filter(age >= 0)
+
+nat_cells <- state_cells |>
+  summarise(n1 = sum(n1), n2 = sum(n2), .by = c(year1, delta, pair, VehicleClass, age)) |>
+  mutate(survival = if_else(n1 > 0, n2 / n1, NA_real_),
+         ann_survival = survival^(1 / delta))
+
+state_cells <- state_cells |>
+  mutate(survival = if_else(n1 > 0, n2 / n1, NA_real_),
+         ann_survival = survival^(1 / delta))
+
+write_csv(nat_cells, file.path(data_dir, "mhdv_national_survival_by_pair.csv"))
+write_csv(state_cells, file.path(data_dir, "mhdv_state_survival_by_pair.csv"))
+
+# Classification consistency. Nationally an age 2-8 cohort can only shrink,
+# so a class whose pooled age 2-8 survival is well above 100%/yr in a pair
+# (or far below its usual level) was re-coded between those two snapshots.
+# Such class x pair cells are left out of schedules, windows and averages.
+pair_check <- nat_cells |>
+  filter(age >= 2, age <= 8) |>
+  summarise(ann_survival = (sum(n2) / sum(n1))^(1 / first(delta)), stock = sum(n1),
+            .by = c(VehicleClass, year1, pair)) |>
+  mutate(consistent = is.finite(ann_survival) & ann_survival <= 1.04 &
+           ann_survival >= median(ann_survival[is.finite(ann_survival)]) - 0.05,
+         .by = VehicleClass)
+ok_pairs <- pair_check |> filter(consistent) |> select(VehicleClass, year1)
+write_csv(pair_check, file.path(out_dir, "mhdv_classification_consistency.csv"))
+
+dropped_pairs <- pair_check |>
+  filter(!consistent, stock > 0) |>
+  summarise(pairs = str_flatten(pair, ", "), years = list(year1), .by = VehicleClass)
+
+# a multi-pair schedule: n1-weighted geometric mean of annualized survival.
+# Pairs of different lengths can't be pooled by summing counts.
+agg_survival <- function(cells, years, by) {
+  cells |>
+    semi_join(ok_pairs, by = join_by(VehicleClass, year1)) |>
+    filter(year1 %in% years, n1 > 0, n2 > 0) |>
+    summarise(ann_survival = exp(sum(n1 * log(ann_survival)) / sum(n1)),
+              n1 = sum(n1), .by = all_of(by))
+}
+
+nat_agg <- agg_survival(nat_cells, year_sets$yrs_excl, c("VehicleClass", "age")) |>
+  arrange(VehicleClass, age)
+state_agg <- agg_survival(state_cells, year_sets$yrs_excl, c("statename", "VehicleClass", "age")) |>
+  arrange(statename, VehicleClass, age)
+
+# cumulative from age 1, stopping where cells get too thin to trust
+min_n <- 20
+cumulate <- function(agg, by, max_age = 30) {
+  agg |>
+    filter(age >= 1, age <= max_age) |>
+    arrange(across(all_of(by)), age) |>
+    mutate(ok = cumall(n1 >= min_n & ann_survival <= 1.5),
+           cum_survival = cumprod(ann_survival), .by = all_of(by)) |>
+    filter(ok)
+}
+nat_cum   <- cumulate(nat_agg, "VehicleClass")
+state_cum <- cumulate(state_agg, c("statename", "VehicleClass"))
+
+write_csv(nat_cum, file.path(data_dir, "mhdv_national_survival_schedule_yrs_excl.csv"))
+write_csv(state_cum, file.path(data_dir, "mhdv_state_survival_schedule_yrs_excl.csv"))
+```
+
+## Is each class counted consistently across snapshots?
+
+```{r consistency-table}
+pair_check |>
+  mutate(cell = case_when(stock == 0 ~ "–",
+                          TRUE ~ paste0(pct(ann_survival, 0.1), if_else(consistent, "", " ⚠"))),
+         VehicleClass = factor(class_labels[VehicleClass], levels = class_labels),
+         pair = factor(pair, levels = pair_levels)) |>
+  select(VehicleClass, pair, cell) |>
+  arrange(VehicleClass, pair) |>
+  pivot_wider(names_from = pair, values_from = cell) |>
+  knitr::kable(caption = "National annualized survival of age 2-8 vehicles, pooled over ages. ⚠ = above 104% or more than 5 points below the class's median: the class was re-coded between those snapshots, so that pair is left out for that class. – = class not identified.")
+```
+
+Transit and school buses are the main problem. Their counts jump between the 2015 and 2017 files and again across the 2019 → 2022 product switch. Bus results below therefore rest mostly on 2017/19 and the three annual pairs from 2022.
+
+# National survival
+
+```{r national-annual}
+#| fig-width: 12
+#| fig-height: 7
+p_nat_ann <- nat_cells |>
+  filter(age >= 1, age <= 30, n1 >= 1000) |>
+  mutate(VehicleClass = factor(class_labels[VehicleClass], levels = class_labels),
+         pair = factor(pair, levels = pair_levels)) |>
+  ggplot(aes(age, ann_survival, color = pair)) +
+  geom_hline(yintercept = 1, color = "#c3c2b7", linewidth = 0.4) +
+  geom_line(linewidth = 0.6) +
+  facet_wrap(~ VehicleClass, ncol = 4) +
+  scale_color_manual(values = pair_cols) +
+  scale_y_continuous(labels = scales::percent, limits = c(0.7, 1.08), oob = scales::squish) +
+  labs(title = "MHDV national annual survival by age, each snapshot pair",
+       subtitle = "Annualized: interval survival^(1/years); ages at the pair's first snapshot; cells under 1,000 vehicles omitted",
+       x = "Age", y = "Annual survival", color = "Pair") +
+  theme_cmp
+p_nat_ann
+ggsave(file.path(out_dir, "mhdv_national_ann_surv_by_pair.png"), p_nat_ann, width = 12, height = 7, dpi = 150)
+```
+
+```{r national-cumulative}
+#| fig-width: 12
+#| fig-height: 7
+nat_cum_pair <- nat_cells |>
+  semi_join(ok_pairs, by = join_by(VehicleClass, year1)) |>
+  cumulate(c("VehicleClass", "pair"))
+
+p_nat_cum <- nat_cum_pair |>
+  mutate(VehicleClass = factor(class_labels[VehicleClass], levels = class_labels),
+         pair = factor(pair, levels = pair_levels)) |>
+  ggplot(aes(age + 1, cum_survival, color = pair)) +
+  geom_line(linewidth = 0.6) +
+  geom_line(data = nat_cum |> mutate(VehicleClass = factor(class_labels[VehicleClass], levels = class_labels)),
+            aes(age + 1, cum_survival), inherit.aes = FALSE, color = "black", linewidth = 0.9) +
+  facet_wrap(~ VehicleClass, ncol = 4) +
+  scale_color_manual(values = pair_cols) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "MHDV national cumulative survival from age 1, each snapshot pair",
+       subtitle = "Black: multi-pair schedule (all pairs excl. 2019/22, stock-weighted geometric mean of annualized survival). Pairs where the class was re-coded are omitted.",
+       x = "Age reached", y = "Share of age-1 vehicles still registered", color = "Pair") +
+  theme_cmp
+p_nat_cum
+ggsave(file.path(out_dir, "mhdv_national_cum_surv_by_pair.png"), p_nat_cum, width = 12, height = 7, dpi = 150)
+
+p_nat_cum_all <- nat_cum |>
+  mutate(VehicleClass = factor(class_labels[VehicleClass], levels = class_labels)) |>
+  ggplot(aes(age + 1, cum_survival, color = VehicleClass)) +
+  geom_line(linewidth = 0.8) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_color_brewer(palette = "Dark2") +
+  labs(title = "MHDV national cumulative survival by class",
+       subtitle = "All pairs excl. 2019/22", x = "Age reached",
+       y = "Share of age-1 vehicles still registered", color = NULL) +
+  theme_cmp + theme(legend.position = "right")
+p_nat_cum_all
+ggsave(file.path(out_dir, "mhdv_national_cum_surv_by_class.png"), p_nat_cum_all, width = 9, height = 5.5, dpi = 150)
+```
+
+# State survival curves
+
+```{r national-vs-state}
+#| fig-width: 12
+#| fig-height: 7
+# each state's annual survival by age (dots) against national (line)
+p_scatter <- state_agg |>
+  filter(age >= 1, age <= 25, n1 >= min_n) |>
+  mutate(VehicleClass = factor(class_labels[VehicleClass], levels = class_labels)) |>
+  ggplot(aes(age, ann_survival)) +
+  geom_point(alpha = 0.25, size = 0.7, color = "#2a78d6") +
+  geom_line(data = nat_agg |> filter(age >= 1, age <= 25) |>
+              mutate(VehicleClass = factor(class_labels[VehicleClass], levels = class_labels)),
+            color = "black", linewidth = 0.8) +
+  facet_wrap(~ VehicleClass, ncol = 4) +
+  scale_y_continuous(labels = scales::percent, limits = c(0.6, 1.2), oob = scales::squish) +
+  labs(title = "MHDV annual survival by age: each state (dots) vs national (line)",
+       subtitle = "All pairs excl. 2019/22; state cells under 20 vehicles omitted",
+       x = "Age", y = "Annual survival") +
+  theme_cmp
+p_scatter
+ggsave(file.path(out_dir, "mhdv_national_state_ann_surv_by_class.png"), p_scatter, width = 12, height = 7, dpi = 150)
+```
+
+```{r state-geofacets}
+#| results: hide
+for (vc in main_classes) {
+  nat_line <- nat_cum |> filter(VehicleClass == vc)
+  p <- state_cum |>
+    filter(VehicleClass == vc) |>
+    ggplot(aes(age + 1, cum_survival)) +
+    geom_line(data = select(nat_line, -VehicleClass), color = "#999999", linewidth = 0.5) +
+    geom_line(color = "#2a78d6", linewidth = 0.6) +
+    facet_geo(~ statename, grid = "us_state_grid2") +
+    scale_y_continuous(labels = scales::percent, breaks = c(0, 0.5, 1)) +
+    scale_x_continuous(breaks = c(5, 15, 25)) +
+    coord_cartesian(ylim = c(0, 1.2)) +
+    labs(title = paste0(class_labels[[vc]], ": cumulative survival by state (blue) vs national (grey)"),
+         subtitle = "All pairs excl. 2019/22; curves stop where a state's cell drops below 20 vehicles",
+         x = "Age reached", y = "Share of age-1 vehicles still registered") +
+    theme_cmp + theme(strip.text = element_text(size = 7), axis.text = element_text(size = 6))
+  ggsave(file.path(out_dir, paste0("mhdv_cum_surv_", str_to_lower(vc), "_bystate_geofacet.png")),
+         p, width = 14, height = 10, dpi = 150)
+}
+```
+
+![](est net flows/mhdv/mhdv_cum_surv_combination_bystate_geofacet.png)
+
+```{r state-by-state}
+#| fig-width: 12
+#| fig-height: 7
+focus_states <- c("California", "Texas", "New York", "Florida", "Illinois", "Hawaii")
+p_states <- state_cum |>
+  filter(statename %in% focus_states, VehicleClass %in% main_classes) |>
+  mutate(VehicleClass = factor(class_labels[VehicleClass], levels = class_labels)) |>
+  ggplot(aes(age + 1, cum_survival, color = statename)) +
+  geom_line(data = nat_cum |> filter(VehicleClass %in% main_classes) |>
+              mutate(VehicleClass = factor(class_labels[VehicleClass], levels = class_labels)),
+            aes(age + 1, cum_survival), inherit.aes = FALSE, color = "black",
+            linetype = "22", linewidth = 0.7) +
+  geom_line(linewidth = 0.7) +
+  facet_wrap(~ VehicleClass, ncol = 3) +
+  scale_color_brewer(palette = "Set1") +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Cumulative MHDV survival, selected states vs national (dashed)",
+       subtitle = "All pairs excl. 2019/22", x = "Age reached",
+       y = "Share of age-1 vehicles still registered", color = NULL) +
+  theme_cmp + theme(legend.position = "right")
+p_states
+ggsave(file.path(out_dir, "mhdv_cum_surv_selected_states.png"), p_states, width = 12, height = 7, dpi = 150)
+```
+
+# Net import and export rates and counts
+
+```{r net-imports}
+# Greene's "old" method on annualized survival: state-minus-national
+# difference at ages 2-8, weighted by cumulative national annual survival.
+# Any missing age (an empty state cell) leaves the rate NA, as in survival.qmd.
+trim_bad <- function(x) if_else(is.na(x) | abs(x) >= 2, NA_real_, x)
+
+# Ages with no national stock in the first snapshot have no national
+# survival; vehicles appearing there are reclassification, not survivors,
+# so those ages are left out (this happens only in the smallest classes).
+nat_w <- nat_cells |>
+  filter(age >= 2, age <= 8, n1 > 0) |>
+  arrange(VehicleClass, year1, age) |>
+  mutate(w = cumprod(ann_survival), .by = c(VehicleClass, year1)) |>
+  select(year1, VehicleClass, age, S_nat = survival, s_nat = ann_survival, w)
+
+ni_long <- state_cells |>
+  filter(age >= 2, age <= 8) |>
+  inner_join(nat_w, by = join_by(year1, VehicleClass, age)) |>
+  mutate(d = trim_bad(ann_survival) - s_nat) |>
+  summarise(rate  = if (anyNA(d)) NA_real_ else sum(w * d) / sum(w),
+            # age-mix accounting over the pair's interval, per year
+            count_agemix = sum(n2 - S_nat * n1) / first(delta),
+            stock = sum(n1),
+            .by = c(VehicleClass, statename, year1, pair, delta)) |>
+  mutate(count_ratestock = rate * stock,
+         # count / stock: the same quantity as the rate, on the state's own
+         # age mix, and defined even when an age cell is empty
+         crude_rate = if_else(stock > 0, count_agemix / stock, NA_real_))
+
+agemix_net <- ni_long |> summarise(net = sum(count_agemix), .by = c(VehicleClass, year1))
+stopifnot(max(abs(agemix_net$net)) < 1e-3)
+write_csv(ni_long, file.path(data_dir, "mhdv_net_imports_by_pair.csv"))
+
+sd_pop <- function(x) { x <- x[!is.na(x)]; sqrt(mean((x - mean(x))^2)) }
+ni_summary <- imap(year_sets, \(yrs, nm) {
+  ni_long |>
+    filter(year1 %in% yrs) |>
+    semi_join(ok_pairs, by = join_by(VehicleClass, year1)) |>
+    summarise(Average        = mean(rate, na.rm = TRUE),
+              Std_Dev        = sd_pop(rate),
+              Average_agemix = mean(count_agemix),
+              Average_stock  = mean(count_ratestock, na.rm = TRUE),
+              stock          = mean(stock),
+              n_pairs        = n(),
+              n_pairs_rate   = sum(!is.na(rate)),
+              .by = c(VehicleClass, statename)) |>
+    mutate(year_set = nm)
+}) |>
+  list_rbind() |>
+  mutate(Average = if_else(is.nan(Average), NA_real_, Average),
+         # window count / window stock: always has the sign of the count.
+         # The mean of per-pair rates can differ in sign from the mean count
+         # when flows swing between pairs or a pair's rate is NA.
+         Average_crude = if_else(stock > 0, Average_agemix / stock, NA_real_))
+write_csv(ni_summary, file.path(data_dir, "mhdv_net_imports_summary.csv"))
+
+# single-pair moves of more than a fifth of a state's age 2-8 stock per
+# year: bulk fleet re-registrations rather than a steady flow
+big_moves <- ni_long |>
+  semi_join(ok_pairs, by = join_by(VehicleClass, year1)) |>
+  filter(VehicleClass %in% c("SU_2b3", "SU_4to8", "Combination"),
+         abs(crude_rate) >= 0.2, stock >= 5000) |>
+  arrange(desc(abs(count_agemix)))
+write_csv(big_moves, file.path(out_dir, "mhdv_large_single_pair_moves.csv"))
+
+ni_summary |>
+  filter(year_set == "yrs_excl", VehicleClass %in% main_classes) |>
+  group_by(VehicleClass) |>
+  slice_max(abs(Average_agemix), n = 6) |>
+  ungroup() |>
+  transmute(Class = class_labels[VehicleClass], State = statename,
+            `Net imports/yr (age-mix)` = scales::comma(round(Average_agemix, -1)),
+            `Count ÷ stock` = pct(Average_crude, 0.1),
+            `Mean national-weights rate` = pct(Average, 0.1),
+            `Age 2-8 stock` = scales::comma(round(stock, -2))) |>
+  knitr::kable(caption = "Largest state net flows by class, all pairs excl. 2019/22")
+
+big_moves |>
+  slice_head(n = 15) |>
+  transmute(Class = class_labels[VehicleClass], State = statename, Pair = pair,
+            `Net imports/yr` = scales::comma(round(count_agemix, -1)),
+            `Count ÷ stock` = pct(crude_rate),
+            `Age 2-8 stock` = scales::comma(round(stock, -2))) |>
+  knitr::kable(caption = "Largest single-pair moves (at least 20% of the state's age 2-8 stock per year, stock ≥ 5,000): bulk fleet re-registrations")
+```
+
+## Balance: do gross imports match gross exports?
+
+```{r balance}
+#| fig-width: 12
+#| fig-height: 6
+balance <- ni_long |>
+  pivot_longer(c(count_agemix, count_ratestock), names_to = "basis", values_to = "flow") |>
+  filter(!is.na(flow)) |>
+  summarise(gross_exports = sum(-pmin(flow, 0)), gross_imports = sum(pmax(flow, 0)),
+            .by = c(VehicleClass, pair, basis)) |>
+  mutate(imports_pct_of_exports = gross_imports / gross_exports,
+         basis = recode(basis, count_agemix = "age-mix accounting",
+                        count_ratestock = "rate × stock"))
+write_csv(balance, file.path(out_dir, "mhdv_balance_by_pair.csv"))
+
+p_bal <- balance |>
+  mutate(VehicleClass = factor(class_labels[VehicleClass], levels = class_labels),
+         pair = factor(pair, levels = pair_levels)) |>
+  ggplot(aes(pair, imports_pct_of_exports, color = basis, group = basis)) +
+  geom_hline(yintercept = 1, color = "#c3c2b7") +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 1.6) +
+  facet_wrap(~ VehicleClass, ncol = 4) +
+  scale_color_manual(values = c(`age-mix accounting` = "#1baf7a", `rate × stock` = "black")) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "Gross imports as % of gross exports across states, by snapshot pair",
+       subtitle = "Age-mix accounting balances to exactly 100% by construction; nothing is rescaled",
+       x = "Pair", y = "Imports as % of exports", color = NULL) +
+  theme_cmp + theme(axis.text.x = element_text(angle = 45, hjust = 1))
+p_bal
+ggsave(file.path(out_dir, "mhdv_balance_by_pair.png"), p_bal, width = 12, height = 6, dpi = 150)
+```
+
+## Are the state rates stable from pair to pair?
+
+```{r rate-geofacets}
+#| results: hide
+for (vc in main_classes) {
+  avg <- ni_summary |> filter(VehicleClass == vc, year_set == "yrs_excl") |> select(statename, Average)
+  p <- ni_long |>
+    filter(VehicleClass == vc) |>
+    mutate(pair = factor(pair, levels = pair_levels), excl = year1 == 2019L) |>
+    ggplot(aes(pair, rate, group = 1)) +
+    geom_hline(yintercept = 0, color = "#c3c2b7", linewidth = 0.3) +
+    geom_hline(data = avg, aes(yintercept = Average), color = "#2a78d6", linewidth = 0.5) +
+    geom_line(linewidth = 0.4) +
+    geom_point(aes(shape = excl), size = 1.2) +
+    scale_shape_manual(values = c(`FALSE` = 16, `TRUE` = 1),
+                       labels = c(`FALSE` = "pair in yrs_excl", `TRUE` = "2019/22 (excluded)"), name = NULL) +
+    facet_geo(~ statename, grid = "us_state_grid2") +
+    scale_y_continuous(labels = scales::percent) +
+    scale_x_discrete(breaks = pair_levels[c(1, 4, 6)]) +
+    coord_cartesian(ylim = c(-0.15, 0.15)) +
+    labs(title = paste0(class_labels[[vc]], ": net import rate by snapshot pair, each state"),
+         subtitle = "Annualized, national-survival weights; blue = mean over all pairs excl. 2019/22; y-axis capped at ±15%",
+         x = NULL, y = "Net import rate (share of age 2-8 stock per year)") +
+    theme_cmp + theme(strip.text = element_text(size = 7), axis.text = element_text(size = 6))
+  ggsave(file.path(out_dir, paste0("mhdv_rates_by_pair_geofacet_", str_to_lower(vc), ".png")),
+         p, width = 14, height = 10, dpi = 150)
+}
+```
+
+![](est net flows/mhdv/mhdv_rates_by_pair_geofacet_combination.png)
+
+```{r stability}
+#| fig-width: 12
+#| fig-height: 10
+stab <- ni_long |>
+  filter(year1 %in% year_sets$yrs_excl, !is.na(rate)) |>
+  semi_join(ok_pairs, by = join_by(VehicleClass, year1)) |>
+  summarise(mean_rate = mean(rate), sd_rate = sd_pop(rate),
+            sign_share = max(mean(rate > 0), mean(rate < 0)),
+            n = n(), .by = c(VehicleClass, statename)) |>
+  mutate(verdict = case_when(
+    n < 3                                  ~ "too few pairs",
+    abs(mean_rate) < 0.005                 ~ "near zero",
+    sign_share >= 0.8 & mean_rate > 0      ~ "stable importer",
+    sign_share >= 0.8 & mean_rate < 0      ~ "stable exporter",
+    TRUE                                   ~ "role flips"))
+write_csv(stab, file.path(out_dir, "mhdv_stability_by_state.csv"))
+
+stab |>
+  count(VehicleClass, verdict) |>
+  pivot_wider(names_from = verdict, values_from = n, values_fill = 0) |>
+  mutate(VehicleClass = factor(class_labels[VehicleClass], levels = class_labels)) |>
+  arrange(VehicleClass) |>
+  knitr::kable(caption = "States per verdict (sign holds in ≥ 80% of the 5 pairs in yrs_excl; |mean| < 0.5%/yr = near zero)")
+
+p_heat <- ni_long |>
+  filter(VehicleClass %in% main_classes) |>
+  mutate(VehicleClass = factor(class_labels[VehicleClass], levels = class_labels),
+         pair = factor(pair, levels = pair_levels),
+         statename = fct_rev(factor(statename))) |>
+  ggplot(aes(pair, statename, fill = rate)) +
+  geom_tile() +
+  facet_wrap(~ VehicleClass, nrow = 1) +
+  scale_fill_gradient2(low = "#7b2d8e", mid = "white", high = "#e67e22",
+                       limits = c(-0.1, 0.1), oob = scales::squish, labels = scales::percent,
+                       na.value = "#eeeeee") +
+  labs(title = "MHDV net import rate by state and snapshot pair",
+       subtitle = "Purple = net exporter, orange = net importer; capped at ±10%/yr; grey = empty age cell",
+       x = NULL, y = NULL, fill = "Rate") +
+  theme_cmp + theme(axis.text.x = element_text(angle = 45, hjust = 1), axis.text.y = element_text(size = 6))
+p_heat
+ggsave(file.path(out_dir, "mhdv_rates_heatmap.png"), p_heat, width = 12, height = 10, dpi = 150)
+```
+
+## Sensitivity to the averaging window
+
+```{r compare-windows}
+#| results: hide
+for (vc in classes) {
+  df <- ni_summary |> filter(VehicleClass == vc, !is.na(Average))
+  state_order <- df |> filter(year_set == "yrs_all") |> arrange(Average) |> pull(statename)
+  p <- df |>
+    mutate(statename = factor(statename, levels = state_order)) |>
+    ggplot(aes(Average, statename, color = year_set)) +
+    geom_vline(xintercept = 0, color = "#c3c2b7", linewidth = 0.4) +
+    geom_point(size = 1.6, alpha = 0.85) +
+    scale_color_manual(values = yearset_cols, labels = year_set_labels, name = "Averaging window") +
+    scale_x_continuous(labels = scales::percent) +
+    labs(title = paste0(class_labels[[vc]], ": sensitivity of net import rate to averaging window"),
+         subtitle = "Annualized, national-survival weights",
+         x = "Net import rate (share of age 2-8 stock per year)", y = NULL) +
+    theme_cmp + guides(color = guide_legend(nrow = 2))
+  ggsave(file.path(out_dir, paste0("mhdv_compare_windows_", str_to_lower(vc), ".png")),
+         p, width = 8, height = 10, dpi = 150)
+}
+```
+
+## Net import maps
+
+```{r tile-maps}
+#| fig-width: 14
+#| fig-height: 8
+# geofacet's grid carries a class dplyr rejects, so take plain columns
+grid <- with(geofacet::us_state_grid2, tibble(statename = name, row, col, code))
+p_map <- ni_summary |>
+  filter(year_set == "yrs_excl", VehicleClass %in% main_classes) |>
+  inner_join(grid, by = join_by(statename)) |>
+  mutate(VehicleClass = factor(class_labels[VehicleClass], levels = class_labels),
+         label = paste0(code, "\n", if_else(is.na(Average), "–", pct(Average)))) |>
+  ggplot(aes(col, -row, fill = Average)) +
+  geom_tile(color = "white", linewidth = 0.6) +
+  geom_text(aes(label = label), size = 2.2, lineheight = 0.9) +
+  facet_wrap(~ VehicleClass, ncol = 3) +
+  scale_fill_gradient2(low = "#7b2d8e", mid = "#f7f7f7", high = "#e67e22",
+                       limits = c(-0.06, 0.06), oob = scales::squish,
+                       labels = scales::percent, na.value = "#dddddd") +
+  coord_equal() +
+  labs(title = "MHDV net import rate by state (all pairs excl. 2019/22)",
+       subtitle = "Annualized, national-survival weights; purple = net exporter, orange = net importer; colors capped at ±6%/yr",
+       fill = "Net import\nrate/yr") +
+  theme_void(base_size = 10) +
+  theme(plot.title.position = "plot", legend.position = "right",
+        strip.text = element_text(size = 10, margin = margin(b = 4)))
+p_map
+ggsave(file.path(out_dir, "mhdv_net_import_rate_maps.png"), p_map, width = 14, height = 8, dpi = 150)
+```
+
+# Sankeys
+
+```{r sankey-helpers}
+# Same rules as survival.qmd: real, unscaled link widths (any gap is in the
+# caption); top 15 + "Other"; labels "State (count; rate%)".
+make_sankey <- function(df, title_text, label_note, extra_note = NULL) {
+  exporters <- df |> filter(flow < 0) |> mutate(flow = abs(flow)) |> arrange(desc(flow))
+  importers <- df |> filter(flow > 0) |> arrange(desc(flow))
+  if (nrow(exporters) > 15)
+    exporters <- bind_rows(slice_head(exporters, n = 15),
+                           tibble(STNAME = "Other exporters", flow = sum(exporters$flow[16:nrow(exporters)]), rate = NA_real_))
+  if (nrow(importers) > 15)
+    importers <- bind_rows(slice_head(importers, n = 15),
+                           tibble(STNAME = "Other importers", flow = sum(importers$flow[16:nrow(importers)]), rate = NA_real_))
+
+  actual_balance <- sum(importers$flow) / sum(exporters$flow)
+  digits <- if (sum(exporters$flow) >= 50000) -2 else -1
+  node_labels <- function(d) {
+    rate_txt <- if_else(is.na(d$rate), "", paste0("; ", pct(d$rate)))
+    paste0(d$STNAME, " (", scales::comma(round(d$flow, digits)), rate_txt, ")")
+  }
+  exp_labels <- node_labels(exporters)
+  imp_labels <- node_labels(importers)
+
+  nodes <- tibble(name  = c(exp_labels, "Net flow pool", imp_labels),
+                  group = c(rep("exporter", nrow(exporters)), "pool", rep("importer", nrow(importers)))) |>
+    mutate(id = row_number() - 1L)
+  pool_id <- nodes |> filter(group == "pool") |> pull(id)
+  links <- bind_rows(
+    tibble(source = match(exp_labels, nodes$name) - 1L, target = pool_id, value = exporters$flow),
+    tibble(source = pool_id, target = match(imp_labels, nodes$name) - 1L, value = importers$flow))
+
+  s <- sankeyNetwork(
+    Links = as.data.frame(links), Nodes = as.data.frame(nodes),
+    Source = "source", Target = "target", Value = "value",
+    NodeID = "name", NodeGroup = "group",
+    colourScale = 'd3.scaleOrdinal().domain(["exporter","pool","importer"]).range(["#7b2d8e","#aaaaaa","#e67e22"])',
+    fontSize = 18, fontFamily = "sans-serif",
+    nodeWidth = 20, nodePadding = 19, sinksRight = TRUE, width = 900, height = 900)
+
+  text_style <- "max-width:860px; text-align:center; font-family:sans-serif;"
+  htmlwidgets::prependContent(
+    s,
+    htmltools::tags$h3(title_text, style = text_style),
+    htmltools::tags$p(paste0("Gross imports = ", pct(actual_balance, 0.1),
+                             " of gross exports across states. ", label_note),
+                      style = paste(text_style, "color:#555555;")),
+    if (!is.null(extra_note))
+      htmltools::tags$p(extra_note, style = paste(text_style, "color:#555555; margin-top:-8px;")))
+}
+
+save_sankey <- function(s, stem) {
+  html_file <- file.path(sankey_dir, paste0(stem, ".html"))
+  htmlwidgets::saveWidget(s, file = html_file, selfcontained = TRUE)
+  webshot2::webshot(html_file, file = file.path(sankey_dir, paste0(stem, ".png")),
+                    vwidth = 920, vheight = 1080, delay = 1)
+}
+
+# a Sankey needs at least one exporter and one importer
+has_flows <- \(df) any(df$flow < 0, na.rm = TRUE) && any(df$flow > 0, na.rm = TRUE)
+
+# The % is count / stock here, not the mean national-weights rate that the
+# LDV Sankeys use. MHDV flows swing between pairs (fleet re-registrations)
+# and some pairs have no rate, so a mean of rates can contradict the side
+# of the diagram the state is on. Count / stock always agrees with it.
+label_note <- paste0("Labels: vehicles/yr, each state's survivors counted age by age against national ",
+                     "survival (interval counts ÷ years); % = those vehicles as a share of the ",
+                     "state's own age 2-8 stock per year.")
+
+plural_names <- c(
+  SU_2b3 = "Class 2b–3 single-unit trucks", SU_4to8 = "Class 4–8 single-unit trucks",
+  Combination = "combination tractors", SchoolBus = "school buses",
+  TransitBus = "transit buses", IntercityBus = "intercity buses",
+  Refuse = "refuse trucks", YardTractor = "yard tractors")
+
+# which of a window's pairs were left out for a class (re-coded, see above)
+dropped_note <- function(vc, yrs) {
+  dr <- pair_check |> filter(VehicleClass == vc, year1 %in% yrs, !consistent, stock > 0)
+  if (nrow(dr) == 0) return(NULL)
+  paste0("Left out for this class, because it was re-coded between those snapshots: ",
+         str_flatten(dr$pair, ", "), ".")
+}
+```
+
+```{r sankeys}
+#| results: hide
+if (render_sankeys) {
+  for (vc in classes) {
+    for (ys in names(year_sets)) {
+      df <- ni_summary |>
+        filter(VehicleClass == vc, year_set == ys) |>
+        select(STNAME = statename, flow = Average_agemix, rate = Average_crude)
+      if (!has_flows(df)) next   # e.g. refuse trucks: not identified before 2022
+      s <- make_sankey(df,
+        paste0("Net Export and Import of used ", plural_names[[vc]],
+               " per year (age 2-8; averaged over ", year_set_labels[[ys]], ")"),
+        label_note,
+        extra_note = dropped_note(vc, year_sets[[ys]]))
+      save_sankey(s, paste0("sankey_mhdv_", str_to_lower(vc), "_", ys))
+    }
+  }
+  for (vc in c("SU_2b3", "SU_4to8", "Combination")) {
+    for (y in pairs$year1) {
+      df <- ni_long |>
+        filter(VehicleClass == vc, year1 == y) |>
+        select(STNAME = statename, flow = count_agemix, rate = crude_rate)
+      if (!has_flows(df)) next
+      pr <- pairs$pair[pairs$year1 == y]
+      s <- make_sankey(df,
+        paste0("Net Export and Import of used ", plural_names[[vc]],
+               " per year, pair ", pr, " (age 2-8)"),
+        label_note,
+        extra_note = if (y == 2019L) "2019/22 spans COVID and Experian's product switch; it is left out of yrs_excl.")
+      save_sankey(s, paste0("sankey_mhdv_", str_to_lower(vc), "_pair_", str_replace(pr, "/", "-")))
+    }
+  }
+}
+```
+
+::: {layout-ncol=3}
+![Single-unit 2b–3](est net flows/mhdv/sankey/sankey_mhdv_su_2b3_yrs_excl.png)
+
+![Single-unit 4–8](est net flows/mhdv/sankey/sankey_mhdv_su_4to8_yrs_excl.png)
+
+![Combination](est net flows/mhdv/sankey/sankey_mhdv_combination_yrs_excl.png)
+:::
+
+# Caveats
+
+- **Experian product switch.** 2015/2017/2019 come from Experian's historical single-national MHD product, and 2022–2025 from the current product. The 2019/22 pair spans that switch and COVID, so `yrs_excl` drops it.
+- **Uneven gaps.** Annualizing a two- or three-year interval as S^(1/Δ) treats survival as constant across those years. Ages are anchored at the first snapshot, so a three-year pair's age-2 cohort is 2–5 years old over the interval.
+- **2022 Class 3 is a lower bound** (no `gvw_class` in that vintage), which affects the Class 2b–3 / 4–8 split in pairs that touch 2022.
+- **Small classes.** Intercity bus, refuse truck and yard tractor have tens of thousands of vehicles nationally, so most state cells are thin. Their rates are noisy, and many states have no rate (an empty age cell). The age-mix counts are still defined.
+- **Refuse trucks are identified only from 2022 on.** The historical product has no refuse bucket, so this class has three pairs (2022/23–2024/25), no `yrs_hist` results, and window averages that cover only those pairs.
+- **Registration practice.** Combination tractors are often apportioned-plated (IRP) in a base state that need not be where they operate, so their state flows partly reflect registration choices. The largest single-pair moves (table above) are bulk fleet re-registrations, e.g. tens of thousands of tractors leaving or entering one state in one year.
