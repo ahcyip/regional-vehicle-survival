@@ -140,6 +140,10 @@ national_survival_list <- year_pairs %>% setNames(year_pairs) %>% map(calculate_
 national_survival_list_fleetsep <- year_pairs %>% setNames(year_pairs) %>% map(calculate_survival, region = "natl", fleet_sep = T, tech_sep = F)
 state_survival_list <- year_pairs %>% setNames(year_pairs) %>% map(calculate_survival, region = "state", fleet_sep = F, tech_sep = F)
 state_survival_list_fleetsep <- year_pairs %>% setNames(year_pairs) %>% map(calculate_survival, region = "state", fleet_sep = T, tech_sep = F)
+
+# by powertrain (Tech: ICEV_Gasoline / BEV / PHEV / FCEV), all owners
+national_survival_list_tech <- year_pairs %>% setNames(year_pairs) %>% map(calculate_survival, region = "natl", fleet_sep = F, tech_sep = T)
+state_survival_list_tech <- year_pairs %>% setNames(year_pairs) %>% map(calculate_survival, region = "state", fleet_sep = F, tech_sep = T)
 ```
 
 ```{r phase1-save-csvs}
@@ -158,6 +162,12 @@ state_survival_list |> bind_rows(.id = "year_pair") |> ungroup() |>
 
 state_survival_list_fleetsep |> bind_rows(.id = "year_pair") |> ungroup() |>
   write_csv(file.path(surv_data_dir, "pipeline_state_survival_fleetsep_14to25.csv"))
+
+national_survival_list_tech |> bind_rows(.id = "year_pair") |> ungroup() |>
+  write_csv(file.path(surv_data_dir, "pipeline_national_survival_tech_14to25.csv"))
+
+state_survival_list_tech |> bind_rows(.id = "year_pair") |> ungroup() |>
+  write_csv(file.path(surv_data_dir, "pipeline_state_survival_tech_14to25.csv"))
 
 # slim deliverables for Greene (same format as before)
 national_survival_list |> bind_rows(.id = "yearpair") |> ungroup() |>
@@ -596,19 +606,19 @@ national_aggregate_allyears_fleetsep <- compute_national_aggregate(national_surv
 
 # cumulative versions (split by year_pair for compatibility with downstream code)
 cumulative_state_survival_list <- state_surv |> group_split(year_pair) |>
-  setNames(map_chr(group_split(state_surv, year_pair), ~ unique(.x$year_pair))) |>
+  setNames(map_chr(group_split(state_surv, year_pair), ~ as.character(unique(.x$year_pair)))) |>
   map(calculate_cumulative_survival)
 
 cumulative_state_survival_list_fleetsep <- state_surv_fleetsep |> group_split(year_pair) |>
-  setNames(map_chr(group_split(state_surv_fleetsep, year_pair), ~ unique(.x$year_pair))) |>
+  setNames(map_chr(group_split(state_surv_fleetsep, year_pair), ~ as.character(unique(.x$year_pair)))) |>
   map(calculate_cumulative_survival)
 
 cumulative_national_survival_list <- national_surv |> group_split(year_pair) |>
-  setNames(map_chr(group_split(national_surv, year_pair), ~ unique(.x$year_pair))) |>
+  setNames(map_chr(group_split(national_surv, year_pair), ~ as.character(unique(.x$year_pair)))) |>
   map(calculate_cumulative_survival)
 
 cumulative_national_survival_list_fleetsep <- national_surv_fleetsep |> group_split(year_pair) |>
-  setNames(map_chr(group_split(national_surv_fleetsep, year_pair), ~ unique(.x$year_pair))) |>
+  setNames(map_chr(group_split(national_surv_fleetsep, year_pair), ~ as.character(unique(.x$year_pair)))) |>
   map(calculate_cumulative_survival)
 
 # pre-bound dataframes for state-by-state plotting
@@ -620,7 +630,7 @@ state_ann_all_fleetsep <- state_surv_fleetsep |> filter(Age1 >= 1)
 # helper to split a dataframe into a named list by year_pair
 split_by_year_pair <- function(df) {
   df |> group_split(year_pair) |>
-    setNames(map_chr(group_split(df, year_pair), ~ unique(.x$year_pair)))
+    setNames(map_chr(group_split(df, year_pair), ~ as.character(unique(.x$year_pair))))
 }
 
 # expose as named lists for sections that iterate by year_pair
