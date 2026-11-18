@@ -1,0 +1,473 @@
+---
+title: "EV survival and state net flows, by powertrain"
+author: "arthur yip"
+format:
+  html:
+    embed-resources: true
+    toc: true
+execute:
+  warning: false
+  message: false
+---
+
+Questions:
+
+1. How does national survival of battery-electric (BEV) and plug-in hybrid (PHEV) light-duty vehicles compare with internal-combustion vehicles, by age?
+2. Are there enough EVs at ages 2-8 for state-level estimates?
+3. Which states are net importers or exporters of used EVs, and do EVs move differently from ICE vehicles?
+
+**Inputs.** These are git-ignored files written by `survival.qmd` Phase 1 (`tech_sep = TRUE`):
+
+- `data/pipeline_national_survival_tech_14to25.csv`
+- `data/pipeline_state_survival_tech_14to25.csv`
+
+Each has one row per yearpair × powertrain (`Tech`: ICEV_Gasoline, BEV, PHEV, FCEV) × vehicle class × age, with stock counts `CY1` (year *t*) and `CY2` (year *t*+1). The data cover all owners and ages 2-8, with ages measured in year *t*.
+
+**Method.** State EV net flows use the same age-mix accounting as the production vehicle Sankeys in `survival.qmd`. A state's net imports of age 2-8 BEVs are its BEV survivors minus what *national BEV survival* would leave from its own BEV stock, age by age:
+
+count~s~ = Σ~a~ (n~s,a,t+1~ − S~nat,a~ · n~s,a,t~)
+
+The comparison is within the same powertrain and class, so these counts sum to exactly zero nationally. They measure interstate movement of used EVs plus any state differences in EV scrappage, not ICE-to-EV substitution. FCEVs (about 17,000 nationally) are too few to analyze.
+
+The % in the Sankey labels is the count ÷ the state's age 2-8 stock of that powertrain, i.e. a crude rate. Greene's age-standardized rate isn't used here, because it needs every age cell filled, and many states have empty EV cells at some ages.
+
+```{r setup}
+library(tidyverse)
+library(networkD3)
+
+data_dir <- here::here("data")
+out_dir  <- here::here("est net flows", "ev")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+sankey_dir <- file.path(out_dir, "sankey")
+dir.create(sankey_dir, showWarnings = FALSE)
+
+# htmlwidgets' self-contained save needs pandoc when run under Rscript
+if (Sys.getenv("RSTUDIO_PANDOC") == "")
+  Sys.setenv(RSTUDIO_PANDOC = "C:/Program Files/RStudio/resources/app/bin/quarto/bin/tools")
+
+render_sankeys <- TRUE
+
+techs       <- c("BEV", "PHEV", "ICEV_Gasoline")
+tech_labels <- c(BEV = "BEV", PHEV = "PHEV", ICEV_Gasoline = "ICE")
+tech_cols   <- c(BEV = "#1baf7a", PHEV = "#2a78d6", ICE = "#555555")
+classes     <- c("Car", "SUV", "Pickup")
+
+# EV window: from 2021/22 on, pooled age 2-8 BEV survival tracks ICE
+# within a point. Earlier yearpairs carry powertrain reclassifications
+# between Experian vintages (see section 0), and EVs at ages 2-8 are few
+# before then anyway. 2022/23 is dropped as in survival.qmd's yrs_excl: its
+# registration-data spikes in VA, MD and MO (+15-28% of stock, all classes)
+# hit BEVs too (+21-43%).
+win_years <- c(2021, 2023, 2024)
+win_label <- "2021/22, 2023/24 and 2024/25 (2022/23 excluded)"
+yp_label  <- \(y) paste0(y, "/", str_sub(y + 1, 3, 4))
+
+read_tech <- function(file) {
+  read_csv(file.path(data_dir, file), show_col_types = FALSE) |>
+    filter(Tech %in% techs, !is.na(VehicleClass), Age1 >= 1) |>
+    transmute(year = as.integer(str_sub(as.character(year_pair), 1, 4)),
+              Tech = factor(tech_labels[Tech], levels = tech_labels),
+              statename = state_name, VehicleClass, age = Age1,
+              # a missing side of the pivot means no vehicles in that year
+              n_t = coalesce(CY1, 0), n_t1 = coalesce(CY2, 0))
+}
+
+nat <- read_tech("pipeline_national_survival_tech_14to25.csv") |> select(-statename)
+st  <- read_tech("pipeline_state_survival_tech_14to25.csv")
+
+# national = pooled states, which makes the state counts sum to zero
+pooled <- st |>
+  summarise(s_t = sum(n_t), s_t1 = sum(n_t1), .by = c(year, Tech, VehicleClass, age)) |>
+  inner_join(nat, by = join_by(year, Tech, VehicleClass, age))
+stopifnot(all(pooled$s_t == pooled$n_t), all(pooled$s_t1 == pooled$n_t1))
+
+theme_ev <- theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank(), legend.position = "top",
+        plot.title.position = "plot")
+```
+
+# 0. Is the powertrain label consistent across Experian vintages?
+
+The same model-year cohort should only shrink from one annual file to the next. For EVs it sometimes jumps or collapses instead. For example, model year 2012–14 PHEV cars grow 50–60% from the 2015 to the 2016 file. Model year 2011 PHEV cars fall 77%, and model year 2011–12 "PHEV SUVs" vanish, from the 2020 to the 2021 file. Those are reclassifications, not scrappage or migration, and they would masquerade as survival. Pooling ages 2-8 shows which yearpairs are affected.
+
+```{r label-consistency}
+consistency <- nat |>
+  filter(age >= 2, age <= 8) |>
+  summarise(survival = sum(n_t1) / sum(n_t), stock = sum(n_t), .by = c(year, Tech)) |>
+  mutate(gap_vs_ice = survival - survival[Tech == "ICE"], .by = year) |>
+  mutate(flag = Tech != "ICE" & abs(gap_vs_ice) > 0.02)
+
+consistency |>
+  transmute(Yearpair = yp_label(year), Tech,
+            cell = paste0(scales::percent(survival, 0.1), if_else(flag, " ⚠", ""))) |>
+  pivot_wider(names_from = Tech, values_from = cell) |>
+  left_join(consistency |>
+              filter(Tech == "BEV") |>
+              transmute(Yearpair = yp_label(year), `Age 2-8 BEVs` = scales::comma(stock)),
+            by = join_by(Yearpair)) |>
+  knitr::kable(caption = "National age 2-8 survival, pooled over ages, by powertrain. ⚠ = more than 2 points from ICE, which points to reclassification.")
+
+consistency |> write_csv(file.path(out_dir, "label_consistency_by_yearpair.csv"))
+```
+
+State flows below use only `r win_label`, where BEV and ICE survival agree. A durable fix for the earlier years would re-derive powertrain from a consistent VIN-level make/model/fuel crosswalk in the raw Experian files, rather than from each vintage's own fuel coding. That step would need the raw files on Eagle/Kestrel.
+
+# 1. National survival by powertrain
+
+```{r national-counts}
+# how many vehicles sit behind each national survival rate
+nat_ldv <- nat |>
+  summarise(n_t = sum(n_t), n_t1 = sum(n_t1), .by = c(year, Tech, age))
+
+nat_ldv |>
+  filter(year == max(year), age <= 12) |>
+  select(Tech, age, n_t) |>
+  pivot_wider(names_from = Tech, values_from = n_t) |>
+  mutate(across(-age, scales::comma)) |>
+  knitr::kable(caption = paste0("Light-duty stock by age in ", max(nat$year),
+                                " (the base of yearpair ", yp_label(max(nat$year)), ")"))
+```
+
+```{r national-survival}
+#| fig-width: 10
+#| fig-height: 4.5
+min_n <- 2000   # national cells smaller than this are not plotted
+
+surv_pooled <- bind_rows(nat, mutate(nat, VehicleClass = "All LDV")) |>
+  filter(year %in% win_years) |>
+  summarise(n_t = sum(n_t), n_t1 = sum(n_t1), .by = c(Tech, VehicleClass, age)) |>
+  mutate(survival = n_t1 / n_t,
+         VehicleClass = factor(VehicleClass, levels = c("All LDV", classes)))
+
+p_surv <- surv_pooled |>
+  filter(age <= 12, n_t >= min_n) |>
+  ggplot(aes(age, survival, color = Tech)) +
+  geom_hline(yintercept = 1, color = "#c3c2b7", linewidth = 0.4) +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.4) +
+  facet_wrap(~ VehicleClass, nrow = 1) +
+  scale_color_manual(values = tech_cols) +
+  scale_x_continuous(breaks = seq(2, 12, 2)) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "National annual survival by age and powertrain",
+       subtitle = paste0("Pooled over yearpairs ", win_label, " (survivors ÷ stock); cells under ",
+                         scales::comma(min_n), " vehicles omitted"),
+       x = "Age in year t", y = "Annual survival", color = NULL) +
+  theme_ev
+p_surv
+ggsave(file.path(out_dir, "national_survival_by_powertrain.png"), p_surv, width = 10, height = 4.5, dpi = 150)
+
+surv_pooled |>
+  write_csv(file.path(out_dir, "national_survival_by_powertrain.csv"))
+```
+
+```{r national-cumulative}
+#| fig-width: 7
+#| fig-height: 4.5
+# cumulative survival from age 1, only as far as every age has enough vehicles
+cum_surv <- surv_pooled |>
+  filter(VehicleClass == "All LDV", age <= 12) |>
+  arrange(Tech, age) |>
+  mutate(ok = cumall(n_t >= min_n), .by = Tech) |>
+  filter(ok) |>
+  mutate(cum_survival = cumprod(survival), .by = Tech)
+
+p_cum <- cum_surv |>
+  ggplot(aes(age + 1, cum_survival, color = Tech)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.5) +
+  scale_color_manual(values = tech_cols) +
+  scale_x_continuous(breaks = seq(2, 13, 1)) +
+  scale_y_continuous(labels = scales::percent, limits = c(NA, 1.02)) +
+  labs(title = "Cumulative survival from age 1, all light-duty vehicles",
+       subtitle = paste0("Product of the pooled annual survival rates, ", win_label),
+       x = "Age reached", y = "Share of age-1 vehicles still registered", color = NULL) +
+  theme_ev
+p_cum
+ggsave(file.path(out_dir, "national_cumulative_survival_by_powertrain.png"), p_cum, width = 7, height = 4.5, dpi = 150)
+```
+
+```{r national-by-yearpair}
+#| fig-width: 10
+#| fig-height: 4.5
+# is EV survival stable across yearpairs, or still changing as the fleet matures?
+p_yp <- nat_ldv |>
+  filter(age %in% c(2, 4, 6, 8), n_t >= min_n) |>
+  mutate(survival = n_t1 / n_t, age = paste("age", age)) |>
+  ggplot(aes(year, survival, color = Tech)) +
+  geom_line(linewidth = 0.7) +
+  geom_point(size = 1.3) +
+  facet_wrap(~ age, nrow = 1) +
+  scale_color_manual(values = tech_cols) +
+  scale_x_continuous(breaks = c(2014, 2018, 2022), labels = yp_label) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(title = "National annual survival by yearpair, all light-duty vehicles",
+       subtitle = paste0("Cells under ", scales::comma(min_n), " vehicles omitted"),
+       x = "Yearpair", y = "Annual survival", color = NULL) +
+  theme_ev
+p_yp
+ggsave(file.path(out_dir, "national_survival_by_yearpair.png"), p_yp, width = 10, height = 4.5, dpi = 150)
+```
+
+# 2. Are there enough EVs for state estimates?
+
+```{r state-cells}
+stock_28 <- st |>
+  filter(age >= 2, age <= 8) |>
+  summarise(stock = sum(n_t), .by = c(year, Tech, statename))
+
+latest <- max(st$year)
+cells <- stock_28 |> filter(year == latest)
+
+thresholds <- c(1000, 5000, 20000)
+map(thresholds, \(k) cells |>
+      summarise(states = sum(stock >= k), .by = Tech) |>
+      mutate(threshold = k)) |>
+  list_rbind() |>
+  pivot_wider(names_from = Tech, values_from = states) |>
+  mutate(threshold = paste("≥", scales::comma(threshold))) |>
+  knitr::kable(caption = paste0("States (of 51) with at least this many age 2-8 vehicles in ", latest,
+                                ", all light-duty classes"))
+
+cells |>
+  write_csv(file.path(out_dir, "state_stock_age2to8_by_powertrain.csv"))
+```
+
+```{r state-cells-plot}
+#| fig-width: 8
+#| fig-height: 9
+p_cells <- cells |>
+  filter(Tech != "ICE") |>
+  mutate(statename = fct_reorder(statename, stock, .fun = max)) |>
+  ggplot(aes(stock, statename, color = Tech)) +
+  geom_vline(xintercept = thresholds, color = "#c3c2b7", linewidth = 0.3) +
+  geom_point(size = 1.8) +
+  scale_color_manual(values = tech_cols) +
+  scale_x_log10(labels = scales::comma) +
+  labs(title = paste0("Age 2-8 EV stock by state, ", latest),
+       subtitle = "Log scale; grey lines at 1,000 / 5,000 / 20,000",
+       x = "Vehicles (all light-duty classes)", y = NULL, color = NULL) +
+  theme_ev
+p_cells
+ggsave(file.path(out_dir, "state_ev_stock_age2to8.png"), p_cells, width = 8, height = 9, dpi = 150)
+```
+
+# 3. State net flows of used EVs
+
+```{r state-flows}
+nat_s <- nat |>
+  filter(age >= 2, age <= 8, n_t > 0) |>
+  transmute(year, Tech, VehicleClass, age, S_nat = n_t1 / n_t)
+
+# age-mix accounting per class (national survival of the same powertrain and
+# class), then summed over classes so the light-duty totals still net to zero
+flows_class <- st |>
+  filter(age >= 2, age <= 8) |>
+  inner_join(nat_s, by = join_by(year, Tech, VehicleClass, age)) |>
+  summarise(count = sum(n_t1 - S_nat * n_t), stock = sum(n_t),
+            .by = c(year, Tech, VehicleClass, statename))
+
+net_check <- flows_class |> summarise(net = sum(count), .by = c(year, Tech, VehicleClass))
+stopifnot(max(abs(net_check$net)) < 1e-3)
+
+flows <- flows_class |>
+  summarise(count = sum(count), stock = sum(stock), .by = c(year, Tech, statename)) |>
+  mutate(rate = if_else(stock > 0, count / stock, NA_real_))
+
+flows_win <- flows |>
+  filter(year %in% win_years) |>
+  summarise(count = mean(count), stock = mean(stock), .by = c(Tech, statename)) |>
+  mutate(rate = if_else(stock > 0, count / stock, NA_real_))
+
+flows |> write_csv(file.path(out_dir, "state_net_flows_by_powertrain_by_year.csv"))
+flows_win |> write_csv(file.path(out_dir, "state_net_flows_by_powertrain_window.csv"))
+
+flows_win |>
+  filter(Tech == "BEV") |>
+  arrange(count) |>
+  slice(c(1:8, (n() - 7):n())) |>
+  transmute(State = statename,
+            `Net BEV imports/yr` = scales::comma(round(count, -1)),
+            `% of age 2-8 BEV stock` = scales::percent(rate, 0.1),
+            `Age 2-8 BEV stock` = scales::comma(round(stock, -2))) |>
+  knitr::kable(caption = paste0("Largest net exporters and importers of used BEVs (age 2-8), mean over ", win_label))
+```
+
+```{r ev-vs-ice}
+#| fig-width: 10
+#| fig-height: 5
+# do EVs move like ICE vehicles? compare each state's net rate by powertrain
+ev_ice <- flows_win |>
+  select(Tech, statename, rate, stock) |>
+  pivot_wider(names_from = Tech, values_from = c(rate, stock)) |>
+  filter(stock_BEV >= 1000)
+
+rho <- with(ev_ice, cor(rate_ICE, rate_BEV, method = "spearman"))
+
+big <- ev_ice |> slice_max(stock_BEV, n = 12)
+p_ev_ice <- ev_ice |>
+  ggplot(aes(rate_ICE, rate_BEV)) +
+  geom_hline(yintercept = 0, color = "#c3c2b7") +
+  geom_vline(xintercept = 0, color = "#c3c2b7") +
+  geom_abline(slope = 1, intercept = 0, linetype = "22", color = "#999999") +
+  geom_point(aes(size = stock_BEV), alpha = 0.6, color = tech_cols[["BEV"]]) +
+  geom_text(data = big, aes(label = statename), size = 3, vjust = -0.9, check_overlap = TRUE) +
+  scale_x_continuous(labels = scales::percent) +
+  scale_y_continuous(labels = scales::percent) +
+  scale_size_area(max_size = 9, labels = scales::comma) +
+  labs(title = "State net import rate: used BEVs vs used ICE vehicles (age 2-8)",
+       subtitle = paste0("Mean over ", win_label, "; states with ≥ 1,000 age 2-8 BEVs; ",
+                         "Spearman ρ = ", round(rho, 2), "; dashed line = equal rates"),
+       x = "ICE net import rate (% of state's age 2-8 ICE stock/yr)",
+       y = "BEV net import rate (% of state's age 2-8 BEV stock/yr)",
+       size = "Age 2-8 BEVs") +
+  theme_ev + theme(legend.position = "right")
+p_ev_ice
+ggsave(file.path(out_dir, "bev_vs_ice_state_rates.png"), p_ev_ice, width = 10, height = 5, dpi = 150)
+```
+
+```{r bev-by-year}
+#| fig-width: 10
+#| fig-height: 5
+top_states <- flows_win |>
+  filter(Tech == "BEV") |>
+  slice_max(abs(count), n = 8) |>
+  pull(statename)
+
+p_bev_year <- flows |>
+  filter(Tech == "BEV", statename %in% top_states, year >= 2017) |>
+  ggplot(aes(year, count, color = statename)) +
+  geom_hline(yintercept = 0, color = "#c3c2b7") +
+  geom_line(linewidth = 0.8) +
+  geom_point(size = 1.5) +
+  scale_x_continuous(breaks = 2017:2024, labels = yp_label) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(title = "Net imports of used BEVs (age 2-8) by yearpair, largest states",
+       subtitle = "Age-mix accounting against national BEV survival; negative = net export",
+       x = "Yearpair", y = "Vehicles/yr", color = NULL) +
+  theme_ev + theme(legend.position = "right")
+p_bev_year
+ggsave(file.path(out_dir, "bev_net_imports_by_year.png"), p_bev_year, width = 10, height = 5, dpi = 150)
+```
+
+# 4. Sankeys
+
+```{r sankey-helpers}
+# df: one row per state, columns STNAME + flow (net imports, vehicles/yr)
+# + rate (net imports as a share of the state's own stock, per yr). Same
+# rules as survival.qmd: real, unscaled link widths; top 15 + "Other".
+make_sankey <- function(df, title_text, label_note, extra_note = NULL) {
+  exporters <- df |> filter(flow < 0) |> mutate(flow = abs(flow)) |> arrange(desc(flow))
+  importers <- df |> filter(flow > 0) |> arrange(desc(flow))
+
+  if (nrow(exporters) > 15) {
+    exporters <- bind_rows(
+      slice_head(exporters, n = 15),
+      tibble(STNAME = "Other exporters", flow = sum(exporters$flow[16:nrow(exporters)]), rate = NA_real_))
+  }
+  if (nrow(importers) > 15) {
+    importers <- bind_rows(
+      slice_head(importers, n = 15),
+      tibble(STNAME = "Other importers", flow = sum(importers$flow[16:nrow(importers)]), rate = NA_real_))
+  }
+
+  actual_balance <- sum(importers$flow) / sum(exporters$flow)
+
+  # EV flows are small, so counts round to tens rather than hundreds
+  node_labels <- function(d) {
+    rate_txt <- if_else(is.na(d$rate), "", paste0("; ", scales::percent(d$rate, accuracy = 1)))
+    paste0(d$STNAME, " (", scales::comma(round(d$flow, -1)), rate_txt, ")")
+  }
+  exp_labels <- node_labels(exporters)
+  imp_labels <- node_labels(importers)
+
+  nodes <- tibble(
+    name  = c(exp_labels, "Net flow pool", imp_labels),
+    group = c(rep("exporter", nrow(exporters)), "pool", rep("importer", nrow(importers)))
+  ) |>
+    mutate(id = row_number() - 1L)
+  pool_id <- nodes |> filter(group == "pool") |> pull(id)
+
+  links <- bind_rows(
+    tibble(source = match(exp_labels, nodes$name) - 1L, target = pool_id, value = exporters$flow),
+    tibble(source = pool_id, target = match(imp_labels, nodes$name) - 1L, value = importers$flow)
+  )
+
+  color_js <- 'd3.scaleOrdinal().domain(["exporter","pool","importer"]).range(["#7b2d8e","#aaaaaa","#e67e22"])'
+
+  s <- sankeyNetwork(
+    Links = as.data.frame(links), Nodes = as.data.frame(nodes),
+    Source = "source", Target = "target", Value = "value",
+    NodeID = "name", NodeGroup = "group", colourScale = color_js,
+    fontSize = 18, fontFamily = "sans-serif",
+    nodeWidth = 20, nodePadding = 19, sinksRight = TRUE,
+    width = 900, height = 900
+  )
+
+  balance_note <- paste0("Gross imports = ", scales::percent(actual_balance, accuracy = 0.1),
+                         " of gross exports across states. ", label_note)
+
+  text_style <- "max-width:860px; text-align:center; font-family:sans-serif;"
+  htmlwidgets::prependContent(
+    s,
+    htmltools::tags$h3(title_text, style = text_style),
+    htmltools::tags$p(balance_note, style = paste(text_style, "color:#555555;")),
+    if (!is.null(extra_note))
+      htmltools::tags$p(extra_note, style = paste(text_style, "color:#555555; margin-top:-8px;"))
+  )
+}
+
+save_sankey <- function(s, stem) {
+  html_file <- file.path(sankey_dir, paste0(stem, ".html"))
+  png_file  <- file.path(sankey_dir, paste0(stem, ".png"))
+  htmlwidgets::saveWidget(s, file = html_file, selfcontained = TRUE)
+  webshot2::webshot(html_file, file = png_file, vwidth = 920, vheight = 1080, delay = 1)
+  invisible(png_file)
+}
+
+label_note <- paste0("Labels: vehicles/yr, each state's survivors counted age by age against ",
+                     "national survival of the same powertrain; % of the state's own age 2-8 ",
+                     "stock of that powertrain per year.")
+```
+
+```{r sankeys}
+#| results: hide
+if (render_sankeys) {
+  for (tc in c("BEV", "PHEV", "ICE")) {
+    df <- flows_win |>
+      filter(Tech == tc) |>
+      select(STNAME = statename, flow = count, rate)
+    s <- make_sankey(df,
+      paste0("Net Export and Import of used ", tc, "s per year (age 2-8 light-duty vehicles; averaged over ",
+             win_label, ")"),
+      label_note)
+    save_sankey(s, paste0("sankey_", str_to_lower(tc), "_avg_window"))
+  }
+  for (y in 2021:2024) {
+    df <- flows |>
+      filter(Tech == "BEV", year == y) |>
+      select(STNAME = statename, flow = count, rate)
+    s <- make_sankey(df,
+      paste0("Net Export and Import of used BEVs, yearpair ", yp_label(y),
+             " (age 2-8 light-duty vehicles)"),
+      label_note,
+      extra_note = if (y == 2022)
+        "2022/23 carries the registration-data spikes in Virginia, Maryland and Missouri, so it is left out of the window averages.")
+    save_sankey(s, paste0("sankey_bev_", y, "_", y + 1))
+  }
+}
+```
+
+::: {layout-ncol=2}
+![BEV, mean over the EV window](est net flows/ev/sankey/sankey_bev_avg_window.png)
+
+![ICE, mean over the EV window](est net flows/ev/sankey/sankey_ice_avg_window.png)
+:::
+
+# Caveats
+
+- **Small cells.** Most states have only a few thousand age 2-8 BEVs, so single-year state rates are noisy. The window averages are more reliable, and so are the larger states (see section 2).
+- **Powertrain reclassification between vintages** (section 0). This affects BEV survival in 2017/18 and 2020/21 and PHEV survival in several yearpairs, so the PHEV results here are less reliable than the BEV ones.
+- **A young, changing fleet.** Age 2-8 BEVs in 2021/22 were model years 2013–2019, while in 2024/25 they are model years 2016–2022. National EV survival is therefore still changing year to year (section 1), and each yearpair's state flows are measured against that year's own national EV survival.
+- **Registration practices.** Lease returns, manufacturer buybacks and fleet disposals move EVs in bulk, and these show up here as state net flows. An owner-type split (`fleet_sep`) could separate them.
+- **Ages 0-1 are excluded,** as in the vehicle Sankeys. New EVs delivered in one state and registered in another are therefore not counted.
