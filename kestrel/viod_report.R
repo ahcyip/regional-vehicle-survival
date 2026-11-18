@@ -24,6 +24,10 @@ out   <- file.path(Sys.getenv("VIOD_REPORTS", "~/viod_reports"), paste(snaps, co
 dir.create(out, recursive = TRUE, showWarnings = FALSE)
 interim_dir <- "/projects/tempo/experian/experian"
 
+# only read snapshots whose conversion passed its row-count check
+done <- file.exists(file.path(root, paste0("_SUCCESS_", snaps)))
+if (!all(done)) stop("not converted, or failed its check: ", paste(snaps[!done], collapse = ", "))
+
 ds <- open_dataset(root) |> filter(snapshot %in% !!snaps)
 snap_year <- as.integer(str_sub(snaps, 1, 4))
 log <- \(...) cat(format(Sys.time(), "%H:%M:%S"), ..., "\n")
@@ -52,7 +56,7 @@ levels_long <- map(fields, \(f) {
   ds |>
     group_by(snapshot, level = !!sym(f)) |>
     summarise(vehicles = sum(vehicle_count)) |>
-    collect() |>
+    collect() |> ungroup() |>
     mutate(field = f)
 }) |>
   list_rbind() |>
@@ -72,7 +76,7 @@ log("category levels done")
 mm <- ds |>
   group_by(snapshot, category, make, model, model_year) |>
   summarise(vehicles = sum(vehicle_count)) |>
-  collect()
+  collect() |> ungroup()
 write_csv(mm, file.path(out, "national_make_model_my_counts.csv"))
 
 mm_wide <- mm |>
@@ -132,7 +136,7 @@ log("interim comparison done")
 state_tot <- ds |>
   group_by(snapshot, state_name) |>
   summarise(vehicles = sum(vehicle_count)) |>
-  collect() |>
+  collect() |> ungroup() |>
   pivot_wider(names_from = snapshot, values_from = vehicles)
 write_csv(state_tot, file.path(out, "state_totals.csv"))
 log("report complete:", out)

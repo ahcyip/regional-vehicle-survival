@@ -92,14 +92,28 @@ blank_na <- map(set_names(text_cols),
 money <- map(set_names(money_cols),
              \(cl) expr(str_replace_all(!!sym(cl), " ?- ?", " - ")))
 
+# start clean: a failed earlier run leaves a partial snapshot behind, and the
+# marker tells viod_report.R that a snapshot passed its row-count check
+snap_dir <- file.path(out_root, paste0("snapshot=", snapshot))
+marker   <- file.path(out_root, paste0("_SUCCESS_", snapshot))
+unlink(c(snap_dir, marker), recursive = TRUE)
+
+# Three files carry a SQL export footer line, "(279328285 rows)", which is not
+# data. 2024Q4 ends with it, and its number is the row count. In 2025Q4 and
+# 2026Q1 it sits mid-file (the rows are shuffled) with a vehicle count of 1,
+# and its number is the vehicle total. It is dropped here and its number is
+# checked against the Parquet totals below.
+footer <- "^[(][0-9]+ rows[)]"
+
 t0 <- Sys.time()
 ds |>
   select(all_of(rename_map)) |>
+  filter(!str_detect(state_name, footer)) |>
   mutate(!!!squish) |>
   mutate(!!!blank_na) |>
   mutate(!!!money,
          zip5          = str_pad(zip_code, 5, side = "left", pad = "0"),
-         # a few rows carry an empty model year, which a direct cast rejects
+         # an empty model year becomes NA instead of failing the cast (none so far)
          model_year    = cast(if_else(str_trim(model_year) == "", NA_character_,
                                       str_trim(model_year)), int32()),
          vehicle_count = cast(str_trim(vehicle_count), int64()),
@@ -108,7 +122,12 @@ ds |>
   write_dataset(out_root, format = "parquet",
                 partitioning = c("snapshot", "state_name"),
                 existing_data_behavior = "delete_matching",
-                compression = "zstd")
+                compression = "zstd",
+                # The 2025Q4+ files are not sorted by state, so each CSV block
+                # holds a few rows for every state. Without a minimum, each of
+                # those slivers becomes its own row group: millions of them,
+                # which ran past 240 GB and 4 h. Buffer rows per state instead.
+                min_rows_per_group = 500000L, max_rows_per_group = 1000000L)
 cat(snapshot, "written in", format(round(Sys.time() - t0, 1)), "\n")
 
 # check: every CSV data row arrived, and no counts were lost to NA casts
@@ -119,7 +138,14 @@ chk <- pq |>
   collect()
 csv_rows <- as.numeric(system2("bash", c("-c", shQuote(paste("tail -n +2", shQuote(src), "| wc -l"))),
                                stdout = TRUE))
+footer_lines <- suppressWarnings(system2("bash", c("-c", shQuote(paste(
+  "LC_ALL=C grep -a -E", shQuote(footer), shQuote(src)))), stdout = TRUE))
+footer_n <- as.numeric(str_extract(footer_lines, "[0-9]+"))
+csv_rows <- csv_rows - length(footer_n)
+if (length(footer_n)) cat(snapshot, "footer says", format(footer_n, big.mark = ","), "rows", fill = TRUE)
 cat(sprintf("%s: parquet rows %s vs csv data rows %s; vehicles %s; NA counts %s; NA model_year rows %s\n",
             snapshot, format(chk$rows, big.mark = ","), format(csv_rows, big.mark = ","),
             format(chk$vehicles, big.mark = ","), chk$na_count, chk$na_my))
-stopifnot(chk$rows == csv_rows, chk$na_count == 0)
+stopifnot(chk$rows == csv_rows, chk$na_count == 0,
+          all(footer_n %in% as.numeric(c(chk$rows, chk$vehicles))))
+invisible(file.create(marker))
